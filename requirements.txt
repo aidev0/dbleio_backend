@@ -1,0 +1,41 @@
+# Backend requirements
+flask
+flask-cors
+numpy
+scikit-learn
+pandas
+
+# API Framework
+fastapi
+uvicorn[standard]
+pydantic
+
+# Database
+pymongo
+
+# AI Model SDKs
+openai
+anthropic
+google-generativeai
+python-dotenv
+
+# Jupyter
+jupyter
+ipykernel
+
+# Video Processing
+ffmpeg-python
+moviepy
+
+# Google Cloud Services
+google-cloud-storage
+google-cloud-videointelligence
+
+# File upload handling
+python-multipart
+
+# HTTP requests
+requests
+
+# Authentication
+workos

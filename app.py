@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""
+FastAPI application for Video Marketing Simulation
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# Import routers
+from campaigns import router as campaigns_router
+from personas import router as personas_router
+from videos import router as videos_router
+from simulations import router as simulations_router, evaluations_router
+from insights import router as insights_router
+from synthesis import router as synthesis_router
+from users import router as users_router
+from chat import router as chat_router
+from tasks import router as tasks_router
+
+# Initialize FastAPI app
+app = FastAPI(title="Video Marketing Simulation API")
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://dble.io",
+        "https://www.dble.io",
+        "https://hpd-video-marketing-sim-c47311d71420.herokuapp.com"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(users_router)
+app.include_router(campaigns_router)
+app.include_router(personas_router)
+app.include_router(videos_router)
+app.include_router(simulations_router)
+app.include_router(evaluations_router)
+app.include_router(insights_router)
+app.include_router(synthesis_router)
+app.include_router(chat_router)
+app.include_router(tasks_router)
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"message": "Video Marketing Simulation API", "version": "1.0.0"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
