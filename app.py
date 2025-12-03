@@ -16,6 +16,7 @@ from synthesis import router as synthesis_router
 from users import router as users_router
 from chat import router as chat_router
 from tasks import router as tasks_router
+from integrations import router as integrations_router, auth_router as integrations_auth_router
 
 # Initialize FastAPI app
 app = FastAPI(title="Video Marketing Simulation API")
@@ -45,6 +46,8 @@ app.include_router(insights_router)
 app.include_router(synthesis_router)
 app.include_router(chat_router)
 app.include_router(tasks_router)
+app.include_router(integrations_router)
+app.include_router(integrations_auth_router)
 
 # Root endpoint
 @app.get("/")

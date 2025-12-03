@@ -36,6 +36,7 @@ python-multipart
 
 # HTTP requests
 requests
+httpx
 
 # Authentication
 workos
