@@ -22,7 +22,14 @@ from auth import APIKeyMiddleware
 # Initialize FastAPI app
 app = FastAPI(title="Video Marketing Simulation API")
 
-# CORS configuration
+# Middleware order matters - they execute in REVERSE order of addition
+# Add APIKeyMiddleware first, then CORS, so CORS wraps around auth responses
+# This ensures CORS headers are added to all responses including auth errors
+
+# API Key authentication middleware (runs second - after CORS)
+app.add_middleware(APIKeyMiddleware)
+
+# CORS configuration (runs first - wraps all responses including auth errors)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -35,9 +42,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# API Key authentication middleware
-app.add_middleware(APIKeyMiddleware)
 
 # Include routers
 app.include_router(users_router)

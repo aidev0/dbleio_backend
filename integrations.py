@@ -3,7 +3,7 @@
 Integrations API - Handle third-party integrations including Shopify
 """
 
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -16,6 +16,7 @@ import hashlib
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from auth import require_user_id, get_workos_user_id
 
 load_dotenv()
 
@@ -64,11 +65,26 @@ class IntegrationCreate(BaseModel):
 
 class ShopifyConnectRequest(BaseModel):
     """Request to initiate Shopify connection"""
-    user_id: str
     store_url: str  # e.g., "mystore.myshopify.com"
+    # Note: user_id is now extracted from JWT, not from request body
 
 
 # Helper functions
+def verify_integration_access(integration_id: str, workos_user_id: str):
+    """
+    Verify user owns the integration.
+    Returns the integration if access is granted, raises HTTPException otherwise.
+    """
+    integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
+    if not integration:
+        raise HTTPException(status_code=404, detail="Integration not found")
+
+    if integration.get("user_id") != workos_user_id:
+        raise HTTPException(status_code=403, detail="Access denied to this integration")
+
+    return integration
+
+
 def integration_helper(integration) -> dict:
     """Convert MongoDB integration to dict"""
     return {
@@ -105,35 +121,47 @@ def normalize_shop_url(store_url: str) -> str:
 # Routes
 
 @router.get("/")
-async def get_integrations(user_id: str):
-    """Get all integrations for a user"""
+async def get_integrations(request: Request):
+    """Get all integrations for the authenticated user"""
     try:
-        integrations = list(db.integrations.find({"user_id": user_id}))
+        # Get user ID from JWT
+        workos_user_id = require_user_id(request)
+
+        integrations = list(db.integrations.find({"user_id": workos_user_id}))
         return [integration_helper(i) for i in integrations]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{integration_id}")
-async def get_integration(integration_id: str):
-    """Get a specific integration"""
+async def get_integration(integration_id: str, request: Request):
+    """Get a specific integration (must be owner)"""
     try:
-        integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
-        if not integration:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        integration = verify_integration_access(integration_id, workos_user_id)
+
         return integration_helper(integration)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/{integration_id}")
-async def delete_integration(integration_id: str):
-    """Delete an integration"""
+async def delete_integration(integration_id: str, request: Request):
+    """Delete an integration (must be owner)"""
     try:
-        result = db.integrations.delete_one({"_id": ObjectId(integration_id)})
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        verify_integration_access(integration_id, workos_user_id)
+
+        db.integrations.delete_one({"_id": ObjectId(integration_id)})
         return {"success": True, "message": "Integration deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -141,17 +169,20 @@ async def delete_integration(integration_id: str):
 # Shopify OAuth Routes
 
 @router.post("/shopify/connect")
-async def initiate_shopify_connection(request: ShopifyConnectRequest):
+async def initiate_shopify_connection(connect_request: ShopifyConnectRequest, request: Request):
     """
     Initiate Shopify OAuth flow
     Returns the authorization URL to redirect the user to
     """
     try:
-        shop = normalize_shop_url(request.store_url)
+        # Get user ID from JWT
+        workos_user_id = require_user_id(request)
+
+        shop = normalize_shop_url(connect_request.store_url)
 
         # Create or update integration record
         existing = db.integrations.find_one({
-            "user_id": request.user_id,
+            "user_id": workos_user_id,
             "type": "shopify",
             "store_url": shop
         })
@@ -164,7 +195,7 @@ async def initiate_shopify_connection(request: ShopifyConnectRequest):
             )
         else:
             new_integration = {
-                "user_id": request.user_id,
+                "user_id": workos_user_id,
                 "type": "shopify",
                 "store_url": shop,
                 "status": "pending",
@@ -176,7 +207,7 @@ async def initiate_shopify_connection(request: ShopifyConnectRequest):
 
         # Build Shopify OAuth URL
         # State contains integration_id and user_id for callback
-        state = f"{integration_id}:{request.user_id}"
+        state = f"{integration_id}:{workos_user_id}"
 
         redirect_uri = f"{SHOPIFY_APP_URL}/api/auth/shopify/callback"
 
@@ -293,14 +324,15 @@ async def shopify_oauth_callback(
 @router.get("/shopify/{integration_id}/products")
 async def get_shopify_products(
     integration_id: str,
+    request: Request,
     limit: int = Query(50, ge=1, le=250),
     page_info: Optional[str] = None
 ):
-    """Fetch products from Shopify store"""
+    """Fetch products from Shopify store (must own integration)"""
     try:
-        integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
-        if not integration:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        integration = verify_integration_access(integration_id, workos_user_id)
 
         if integration.get("status") != "connected":
             raise HTTPException(status_code=400, detail="Integration not connected")
@@ -352,15 +384,16 @@ async def get_shopify_products(
 @router.get("/shopify/{integration_id}/orders")
 async def get_shopify_orders(
     integration_id: str,
+    request: Request,
     limit: int = Query(50, ge=1, le=250),
     status: str = Query("any"),  # any, open, closed, cancelled
     page_info: Optional[str] = None
 ):
-    """Fetch orders from Shopify store"""
+    """Fetch orders from Shopify store (must own integration)"""
     try:
-        integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
-        if not integration:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        integration = verify_integration_access(integration_id, workos_user_id)
 
         if integration.get("status") != "connected":
             raise HTTPException(status_code=400, detail="Integration not connected")
@@ -411,14 +444,15 @@ async def get_shopify_orders(
 @router.get("/shopify/{integration_id}/customers")
 async def get_shopify_customers(
     integration_id: str,
+    request: Request,
     limit: int = Query(50, ge=1, le=250),
     page_info: Optional[str] = None
 ):
-    """Fetch customers from Shopify store"""
+    """Fetch customers from Shopify store (must own integration)"""
     try:
-        integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
-        if not integration:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        integration = verify_integration_access(integration_id, workos_user_id)
 
         if integration.get("status") != "connected":
             raise HTTPException(status_code=400, detail="Integration not connected")
@@ -467,12 +501,12 @@ async def get_shopify_customers(
 
 
 @router.get("/shopify/{integration_id}/analytics")
-async def get_shopify_analytics(integration_id: str):
-    """Get basic analytics/counts from Shopify store"""
+async def get_shopify_analytics(integration_id: str, request: Request):
+    """Get basic analytics/counts from Shopify store (must own integration)"""
     try:
-        integration = db.integrations.find_one({"_id": ObjectId(integration_id)})
-        if not integration:
-            raise HTTPException(status_code=404, detail="Integration not found")
+        # Verify user owns this integration
+        workos_user_id = require_user_id(request)
+        integration = verify_integration_access(integration_id, workos_user_id)
 
         if integration.get("status") != "connected":
             raise HTTPException(status_code=400, detail="Integration not connected")
