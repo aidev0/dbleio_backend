@@ -17,6 +17,7 @@ from users import router as users_router
 from chat import router as chat_router
 from tasks import router as tasks_router
 from integrations import router as integrations_router, auth_router as integrations_auth_router
+from auth import APIKeyMiddleware
 
 # Initialize FastAPI app
 app = FastAPI(title="Video Marketing Simulation API")
@@ -34,6 +35,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# API Key authentication middleware
+app.add_middleware(APIKeyMiddleware)
 
 # Include routers
 app.include_router(users_router)
