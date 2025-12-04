@@ -58,6 +58,11 @@ class AuthCallbackRequest(BaseModel):
     state: Optional[str] = None
 
 
+class RefreshTokenRequest(BaseModel):
+    """Request body for token refresh"""
+    refresh_token: str
+
+
 # Helper functions
 def user_helper(user) -> dict:
     """Convert MongoDB user to dict"""
@@ -165,6 +170,34 @@ async def auth_callback(request: AuthCallbackRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
+
+
+@router.post("/auth/refresh")
+async def refresh_token(request: RefreshTokenRequest):
+    """
+    Refresh an expired access token using a refresh token
+    """
+    try:
+        from workos import WorkOSClient
+
+        workos = WorkOSClient(api_key=WORKOS_API_KEY, client_id=WORKOS_CLIENT_ID)
+
+        # Use WorkOS to refresh the token
+        auth_response = workos.user_management.authenticate_with_refresh_token(
+            refresh_token=request.refresh_token
+        )
+
+        return {
+            "success": True,
+            "access_token": auth_response.access_token,
+            "refresh_token": auth_response.refresh_token
+        }
+
+    except Exception as e:
+        print(f"Token refresh error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
 
 
 @router.get("/me")

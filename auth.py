@@ -38,6 +38,7 @@ EXCLUDED_PATHS = [
     "/openapi.json",
     "/api/auth/shopify/callback",  # Shopify OAuth callback
     "/api/users/auth/callback",  # WorkOS auth callback (needs to work without token)
+    "/api/users/auth/refresh",  # Token refresh endpoint (needs to work with expired token)
 ]
 
 # Cache for JWKS keys
