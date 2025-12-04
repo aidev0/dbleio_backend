@@ -3,9 +3,10 @@
 Campaign routes and models
 """
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
+from auth import get_workos_user_id, require_user_id
 from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
@@ -99,6 +100,33 @@ class CampaignResponse(BaseModel):
     updated_at: datetime
 
 # Helper functions
+def verify_campaign_access(campaign_id: str, workos_user_id: str, require_owner: bool = False):
+    """
+    Verify user has access to a campaign.
+    Returns the campaign if access is granted, raises HTTPException otherwise.
+
+    Args:
+        campaign_id: The campaign ID to check
+        workos_user_id: The authenticated user's WorkOS ID
+        require_owner: If True, only the owner can access (not shared users)
+    """
+    campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    campaign_owner = campaign.get("workos_user_id")
+    shared_ids = campaign.get("shared_ids", [])
+
+    if require_owner:
+        if campaign_owner != workos_user_id:
+            raise HTTPException(status_code=403, detail="Only the campaign owner can perform this action")
+    else:
+        if campaign_owner != workos_user_id and workos_user_id not in shared_ids:
+            raise HTTPException(status_code=403, detail="Access denied to this campaign")
+
+    return campaign
+
+
 def campaign_helper(campaign) -> dict:
     """Convert MongoDB campaign to dict"""
     return {
@@ -120,50 +148,63 @@ def campaign_helper(campaign) -> dict:
 
 # Routes
 @router.get("", response_model=List[CampaignResponse])
-async def get_campaigns(user_id: Optional[str] = None, workos_user_id: Optional[str] = None):
-    """Get all campaigns, optionally filtered by user_id or workos_user_id (including campaigns shared with the user)"""
+async def get_campaigns(request: Request):
+    """Get all campaigns for the authenticated user (including campaigns shared with the user)"""
     try:
-        query = {}
+        # Get user ID from JWT - required for this endpoint
+        workos_user_id = require_user_id(request)
 
         # Build query to include campaigns owned by user OR shared with user
-        if user_id or workos_user_id:
-            or_conditions = []
-
-            if user_id:
-                or_conditions.append({"user_id": user_id})
-
-            if workos_user_id:
-                # Include campaigns owned by this user OR campaigns where this user is in shared_ids
-                or_conditions.append({"workos_user_id": workos_user_id})
-                or_conditions.append({"shared_ids": workos_user_id})
-
-            if len(or_conditions) > 0:
-                query["$or"] = or_conditions
+        query = {
+            "$or": [
+                {"workos_user_id": workos_user_id},
+                {"shared_ids": workos_user_id}
+            ]
+        }
 
         campaigns = db.campaigns.find(query)
         return [campaign_helper(campaign) for campaign in campaigns]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(campaign_id: str):
-    """Get a single campaign by ID"""
+async def get_campaign(campaign_id: str, request: Request):
+    """Get a single campaign by ID (must be owner or shared with user)"""
     try:
+        # Get user ID from JWT
+        workos_user_id = require_user_id(request)
+
         campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
         if not campaign:
             raise HTTPException(status_code=404, detail="Campaign not found")
+
+        # Check if user has access (owner or shared)
+        campaign_owner = campaign.get("workos_user_id")
+        shared_ids = campaign.get("shared_ids", [])
+
+        if campaign_owner != workos_user_id and workos_user_id not in shared_ids:
+            raise HTTPException(status_code=403, detail="Access denied to this campaign")
+
         return campaign_helper(campaign)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(campaign: CampaignCreate):
-    """Create a new campaign"""
+async def create_campaign(campaign: CampaignCreate, request: Request):
+    """Create a new campaign (owned by authenticated user)"""
     try:
+        # Get user ID from JWT - this is the campaign owner
+        workos_user_id = require_user_id(request)
+
         # Use mode='json' and exclude_none=False to ensure all fields are included
         campaign_dict = campaign.model_dump(mode='json', exclude_none=False)
-        print(f"DEBUG: Received campaign data: {campaign_dict}")
-        print(f"DEBUG: Description field: '{campaign_dict.get('description')}'")
+
+        # Override workos_user_id with authenticated user - don't trust client-provided value
+        campaign_dict['workos_user_id'] = workos_user_id
 
         # Ensure description field is always present (even if None or empty string)
         if 'description' not in campaign_dict:
@@ -176,25 +217,36 @@ async def create_campaign(campaign: CampaignCreate):
         new_campaign = db.campaigns.find_one({"_id": result.inserted_id})
 
         return campaign_helper(new_campaign)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(campaign_id: str, campaign_update: CampaignUpdate):
-    """Update an existing campaign"""
+async def update_campaign(campaign_id: str, campaign_update: CampaignUpdate, request: Request):
+    """Update an existing campaign (must be owner)"""
     try:
+        # Get user ID from JWT
+        workos_user_id = require_user_id(request)
+
         # Check if campaign exists
         existing_campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
         if not existing_campaign:
             raise HTTPException(status_code=404, detail="Campaign not found")
 
+        # Only owner can update (not shared users)
+        if existing_campaign.get("workos_user_id") != workos_user_id:
+            raise HTTPException(status_code=403, detail="Only the campaign owner can update it")
+
         # Update fields - include all provided fields, even if None
         # Use exclude_unset=True to only get fields that were explicitly set in the request
         update_dict = campaign_update.model_dump(exclude_unset=True)
-        update_dict["updated_at"] = datetime.utcnow()
 
-        print(f"DEBUG UPDATE: Update dict: {update_dict}")
-        print(f"DEBUG UPDATE: Description in update: '{update_dict.get('description', 'NOT IN UPDATE')}')")
+        # Don't allow changing ownership via update
+        if 'workos_user_id' in update_dict:
+            del update_dict['workos_user_id']
+
+        update_dict["updated_at"] = datetime.utcnow()
 
         db.campaigns.update_one(
             {"_id": ObjectId(campaign_id)},
@@ -203,16 +255,30 @@ async def update_campaign(campaign_id: str, campaign_update: CampaignUpdate):
 
         updated_campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
         return campaign_helper(updated_campaign)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_campaign(campaign_id: str):
-    """Delete a campaign"""
+async def delete_campaign(campaign_id: str, request: Request):
+    """Delete a campaign (must be owner)"""
     try:
-        result = db.campaigns.delete_one({"_id": ObjectId(campaign_id)})
-        if result.deleted_count == 0:
+        # Get user ID from JWT
+        workos_user_id = require_user_id(request)
+
+        # Check if campaign exists and user is owner
+        existing_campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+        if not existing_campaign:
             raise HTTPException(status_code=404, detail="Campaign not found")
+
+        # Only owner can delete
+        if existing_campaign.get("workos_user_id") != workos_user_id:
+            raise HTTPException(status_code=403, detail="Only the campaign owner can delete it")
+
+        db.campaigns.delete_one({"_id": ObjectId(campaign_id)})
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -244,13 +310,12 @@ class SynthesisResponse(BaseModel):
 
 
 @router.post("/{campaign_id}/generate-synthesis", response_model=SynthesisResponse)
-async def generate_synthesis(campaign_id: str, request: SynthesisRequest):
+async def generate_synthesis(campaign_id: str, synthesis_request: SynthesisRequest, request: Request):
     """Generate an AI-powered video synthesis timeline based on user's description"""
     try:
-        # Get campaign
-        campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-        if not campaign:
-            raise HTTPException(status_code=404, detail="Campaign not found")
+        # Verify user has access to this campaign
+        workos_user_id = require_user_id(request)
+        campaign = verify_campaign_access(campaign_id, workos_user_id)
 
         # Get all videos for this campaign
         videos = list(db.videos.find({"campaign_id": campaign_id}))
@@ -383,7 +448,7 @@ Timeline segments: {json.dumps(v['analysis']['timeline'], indent=2)}"""
 
         prompt = f"""You are an expert video editor and marketing strategist. The user wants to create a synthesized video by combining segments from multiple marketing videos.
 
-USER'S REQUEST: {request.description}
+USER'S REQUEST: {synthesis_request.description}
 
 You have access to {len(gemini_videos)} videos. Here are the analyses of each video:
 
@@ -474,7 +539,7 @@ IMPORTANT:
         # Save synthesis to database
         synthesis_record = {
             "campaign_id": campaign_id,
-            "user_description": request.description,
+            "user_description": synthesis_request.description,
             "synthesis_plan": synthesis_data,
             "videos_count": len(gemini_videos),
             "created_at": datetime.utcnow(),
@@ -506,9 +571,13 @@ class SynthesisVideoResponse(BaseModel):
 
 
 @router.get("/{campaign_id}/synthesis-plans")
-async def get_synthesis_plans(campaign_id: str):
+async def get_synthesis_plans(campaign_id: str, request: Request):
     """Get all synthesis plans for a campaign"""
     try:
+        # Verify user has access to this campaign
+        workos_user_id = require_user_id(request)
+        verify_campaign_access(campaign_id, workos_user_id)
+
         plans = list(db.synthesis_plans.find(
             {"campaign_id": campaign_id}
         ).sort("created_at", -1))
@@ -517,14 +586,20 @@ async def get_synthesis_plans(campaign_id: str):
             plan["_id"] = str(plan["_id"])
 
         return plans
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{campaign_id}/synthesis-videos")
-async def get_synthesis_videos(campaign_id: str):
+async def get_synthesis_videos(campaign_id: str, request: Request):
     """Get all synthesis videos for a campaign"""
     try:
+        # Verify user has access to this campaign
+        workos_user_id = require_user_id(request)
+        verify_campaign_access(campaign_id, workos_user_id)
+
         videos = list(db.synthesis_videos.find(
             {"campaign_id": campaign_id}
         ).sort("created_at", -1))
@@ -533,18 +608,19 @@ async def get_synthesis_videos(campaign_id: str):
             video["_id"] = str(video["_id"])
 
         return videos
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{campaign_id}/produce-synthesis-video", response_model=SynthesisVideoResponse)
-async def produce_synthesis_video(campaign_id: str):
+async def produce_synthesis_video(campaign_id: str, request: Request):
     """Produce an actual synthesis video from the most recent synthesis plan"""
     try:
-        # Get campaign
-        campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
-        if not campaign:
-            raise HTTPException(status_code=404, detail="Campaign not found")
+        # Verify user has access to this campaign
+        workos_user_id = require_user_id(request)
+        campaign = verify_campaign_access(campaign_id, workos_user_id)
 
         # Get most recent synthesis plan for this campaign
         synthesis_plan = db.synthesis_plans.find_one(

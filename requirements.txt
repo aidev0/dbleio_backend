@@ -40,3 +40,4 @@ httpx
 
 # Authentication
 workos
+PyJWT[crypto]

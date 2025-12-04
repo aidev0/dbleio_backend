@@ -119,13 +119,41 @@ class VideoResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 # Helper functions
+def get_fresh_signed_url(gs_uri: str) -> Optional[str]:
+    """Generate a fresh signed URL from a GCS URI (gs://bucket/path)"""
+    if not gs_uri or not gs_uri.startswith('gs://') or not gcs_bucket:
+        return None
+    try:
+        # Extract blob path from gs://bucket/path
+        path = gs_uri.replace(f'gs://{GCS_BUCKET}/', '')
+        blob = gcs_bucket.blob(path)
+        creds = get_google_credentials()
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(hours=1),  # 1 hour for viewing
+            method="GET",
+            credentials=creds
+        )
+        return signed_url
+    except Exception as e:
+        print(f"Error generating signed URL for {gs_uri}: {e}")
+        return None
+
 def video_helper(video, include_analysis=True) -> dict:
     """Convert MongoDB video to dict"""
+    # If video has a gs_uri, generate a fresh signed URL
+    video_url = video["url"]
+    gs_uri = video.get("gs_uri")
+    if gs_uri:
+        fresh_url = get_fresh_signed_url(gs_uri)
+        if fresh_url:
+            video_url = fresh_url
+
     result = {
         "id": str(video["_id"]),
         "campaign_id": video["campaign_id"],
         "title": video["title"],
-        "url": video["url"],
+        "url": video_url,
         "thumbnail_url": video.get("thumbnail_url"),
         "duration": video.get("duration"),
         "created_at": video.get("created_at", datetime.utcnow()),
