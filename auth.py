@@ -31,6 +31,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
+        # Skip validation for CORS preflight requests
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # Skip validation for excluded paths
         path = request.url.path
         if any(path == excluded or path.startswith(excluded + "?") for excluded in EXCLUDED_PATHS):
