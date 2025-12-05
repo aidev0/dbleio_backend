@@ -36,7 +36,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://dble.io",
         "https://www.dble.io",
-        "https://hpd-video-marketing-sim-c47311d71420.herokuapp.com"
+        "https://dbleio-frontend-15e04e0b3c03.herokuapp.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
