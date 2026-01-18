@@ -17,6 +17,9 @@ from users import router as users_router
 from chat import router as chat_router
 from tasks import router as tasks_router
 from integrations import router as integrations_router, auth_router as integrations_auth_router
+from feature_requests import router as feature_requests_router
+from plans import router as plans_router
+from support_chat import router as support_chat_router
 from auth import APIKeyMiddleware
 
 # Initialize FastAPI app
@@ -56,6 +59,9 @@ app.include_router(chat_router)
 app.include_router(tasks_router)
 app.include_router(integrations_router)
 app.include_router(integrations_auth_router)
+app.include_router(feature_requests_router)
+app.include_router(plans_router)
+app.include_router(support_chat_router)
 
 # Root endpoint
 @app.get("/")
