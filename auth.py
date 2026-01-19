@@ -39,6 +39,7 @@ EXCLUDED_PATHS = [
     "/api/auth/shopify/callback",  # Shopify OAuth callback
     "/api/users/auth/callback",  # WorkOS auth callback (needs to work without token)
     "/api/users/auth/refresh",  # Token refresh endpoint (needs to work with expired token)
+    "/api/feature-requests",  # Public form submissions from landing page
 ]
 
 # Cache for JWKS keys
