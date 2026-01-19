@@ -158,12 +158,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Skip validation for excluded paths
         path = request.url.path
 
+        # Debug: Print path for troubleshooting
+        print(f"[AUTH] Checking path: '{path}'")
+
         # Check for exact match, path with query string, or path with trailing slash
         for excluded in EXCLUDED_PATHS:
             if path == excluded or path.startswith(excluded + "?") or path.startswith(excluded + "/"):
+                print(f"[AUTH] Path '{path}' matched exclusion '{excluded}' - skipping auth")
                 return await call_next(request)
             # Also check if the excluded path ends with a pattern that should match
             if excluded.startswith("/api/") and path.startswith(excluded):
+                print(f"[AUTH] Path '{path}' starts with exclusion '{excluded}' - skipping auth")
                 return await call_next(request)
 
         # Skip validation if no API key is configured (development mode)

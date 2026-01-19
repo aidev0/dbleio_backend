@@ -3,8 +3,9 @@
 FastAPI application for Video Marketing Simulation
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 # Import routers
 from campaigns import router as campaigns_router
@@ -46,6 +47,31 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+# Explicit OPTIONS handler for CORS preflight - handles all paths
+@app.options("/{path:path}")
+async def options_handler(request: Request, path: str):
+    """Handle CORS preflight requests explicitly"""
+    origin = request.headers.get("origin", "")
+    allowed_origins = [
+        "http://localhost:3000",
+        "https://dble.io",
+        "https://www.dble.io",
+        "https://dbleio-frontend-15e04e0b3c03.herokuapp.com"
+    ]
+
+    if origin in allowed_origins:
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "86400",
+            }
+        )
+    return Response(status_code=400)
 
 # Include routers
 app.include_router(users_router)
