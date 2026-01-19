@@ -42,8 +42,9 @@ app.add_middleware(
         "https://dbleio-frontend-15e04e0b3c03.herokuapp.com"
     ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Include routers

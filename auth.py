@@ -150,9 +150,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
-        # Skip validation for CORS preflight requests
+        # Skip validation for CORS preflight requests - let CORS middleware handle
         if request.method == "OPTIONS":
-            return await call_next(request)
+            response = await call_next(request)
+            return response
 
         # Skip validation for excluded paths
         path = request.url.path
