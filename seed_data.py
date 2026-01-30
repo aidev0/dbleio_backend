@@ -12,7 +12,7 @@ load_dotenv()
 
 # Connect
 client = MongoClient(os.getenv('MONGODB_URI'))
-db = client[os.getenv('MONGODB_DB_NAME', 'video_marketing_db')]
+db = client[os.getenv('MONGODB_DB_NAME', 'dble_db')]
 
 # Clear all
 print("Clearing database...")

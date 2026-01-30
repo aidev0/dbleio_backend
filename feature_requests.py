@@ -14,8 +14,9 @@ router = APIRouter(prefix="/api/feature-requests", tags=["feature-requests"])
 
 # MongoDB connection
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "dble_db")
 client = MongoClient(MONGODB_URI)
-db = client.dble
+db = client[MONGODB_DB_NAME]
 
 
 class FeatureRequest(BaseModel):

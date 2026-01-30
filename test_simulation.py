@@ -13,7 +13,7 @@ load_dotenv()
 # MongoDB connection
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 client = MongoClient(MONGODB_URI)
-db = client['video_marketing_db']
+db = client['dble_db']
 
 def test_simulation_data():
     print("=" * 80)

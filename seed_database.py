@@ -20,7 +20,7 @@ MONGODB_URI = os.getenv('MONGODB_URI')
 if not MONGODB_URI:
     raise ValueError("MONGODB_URI not found in environment variables")
 
-MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'video_marketing_db')
+MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'dble_db')
 
 client = MongoClient(MONGODB_URI)
 db = client[MONGODB_DB_NAME]

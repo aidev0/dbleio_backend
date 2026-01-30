@@ -14,8 +14,9 @@ router = APIRouter(prefix="/api/plans", tags=["plans"])
 
 # MongoDB connection
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "dble_db")
 client = MongoClient(MONGODB_URI)
-db = client.dble
+db = client[MONGODB_DB_NAME]
 
 # Default plans
 DEFAULT_PLANS = [
@@ -119,27 +120,6 @@ ADD_ONS = [
         "available_for": ["team", "enterprise"]
     }
 ]
-
-
-def seed_plans():
-    """Seed the database with default plans if they don't exist"""
-    for plan in DEFAULT_PLANS:
-        existing = db.plans.find_one({"id": plan["id"]})
-        if not existing:
-            plan["created_at"] = datetime.utcnow()
-            plan["updated_at"] = datetime.utcnow()
-            db.plans.insert_one(plan)
-
-    for addon in ADD_ONS:
-        existing = db.add_ons.find_one({"id": addon["id"]})
-        if not existing:
-            addon["created_at"] = datetime.utcnow()
-            addon["updated_at"] = datetime.utcnow()
-            db.add_ons.insert_one(addon)
-
-
-# Seed plans on module load
-seed_plans()
 
 
 @router.get("")
