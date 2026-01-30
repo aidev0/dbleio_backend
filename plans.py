@@ -32,7 +32,7 @@ DEFAULT_PLANS = [
             "active_build_requests": 0,
             "parallel_builds": False,
             "onboarding": True,
-            "llm_credits": 1000
+            "cloud_llm_credits": "$1000 cloud + LLM usage credits included"
         },
         "best_for": [
             "Platform access only",
@@ -44,55 +44,29 @@ DEFAULT_PLANS = [
         "active": True
     },
     {
-        "id": "starter",
-        "name": "Starter",
+        "id": "scale",
+        "name": "SCALE",
         "price": 6000,
         "currency": "USD",
         "billing_period": "monthly",
         "commitment_months": 1,
-        "description": "$250K–$1M annual ad spend. Lean team of 1-3 people.",
+        "description": "$250K+ annual ad spend. Lean team of 1-3 people.",
         "features": {
             "platform_access": "full",
             "active_build_requests": 1,
             "parallel_builds": False,
             "onboarding": True,
-            "llm_credits": 1000
+            "cloud_llm_credits": "$1000 cloud + LLM usage credits included",
+            "dedicated_fem": 1
         },
         "best_for": [
-            "$250K–$1M annual ad spend",
+            "$250K+ annual ad spend",
             "Lean team (1-3 people in marketing)",
             "Want to prove ROI before going all-in",
             "Need to solve one major bottleneck"
         ],
         "compliance": ["SOC 2", "GDPR", "CCPA"],
         "security": ["Enterprise-grade Encryption", "Database", "Cloud", "PCI-Compliant Payments"],
-        "active": True
-    },
-    {
-        "id": "team",
-        "name": "Team",
-        "price": 10000,
-        "currency": "USD",
-        "billing_period": "monthly",
-        "commitment_months": 3,
-        "description": "$1M+ annual ad spend. Marketing team of 3-8 people.",
-        "features": {
-            "platform_access": "full",
-            "active_build_requests": 2,
-            "parallel_builds": True,
-            "onboarding": True,
-            "llm_credits": 1000
-        },
-        "best_for": [
-            "$1M+ annual ad spend",
-            "Marketing team of 3-8 people",
-            "Sell across multiple platforms (Shopify + Amazon + TikTok Shop)",
-            "Want end-to-end automation from generation to optimization",
-            "Need systems working together, not in isolation"
-        ],
-        "compliance": ["SOC 2", "GDPR", "CCPA"],
-        "security": ["Enterprise-grade Encryption", "Database", "Cloud", "PCI-Compliant Payments"],
-        "add_ons_available": ["fdm", "fde"],
         "active": True
     },
     {
@@ -109,7 +83,7 @@ DEFAULT_PLANS = [
             "active_build_requests": "3+",
             "parallel_builds": True,
             "onboarding": True,
-            "llm_credits": "custom",
+            "cloud_llm_credits": "custom",
             "custom_solutions": True
         },
         "best_for": [

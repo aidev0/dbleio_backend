@@ -40,6 +40,7 @@ EXCLUDED_PATHS = [
     "/api/users/auth/callback",  # WorkOS auth callback (needs to work without token)
     "/api/users/auth/refresh",  # Token refresh endpoint (needs to work with expired token)
     "/api/feature-requests",  # Public form submissions from landing page
+    "/api/contact",  # Public contact form submissions
 ]
 
 # Cache for JWKS keys

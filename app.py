@@ -21,6 +21,7 @@ from integrations import router as integrations_router, auth_router as integrati
 from feature_requests import router as feature_requests_router
 from plans import router as plans_router
 from support_chat import router as support_chat_router
+from contact_forms import router as contact_forms_router
 from auth import APIKeyMiddleware
 
 # Initialize FastAPI app
@@ -38,6 +39,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
+        "http://localhost:3333",
         "https://dble.io",
         "https://www.dble.io",
         "https://dbleio-frontend-15e04e0b3c03.herokuapp.com"
@@ -55,6 +57,7 @@ async def options_handler(request: Request, path: str):
     origin = request.headers.get("origin", "")
     allowed_origins = [
         "http://localhost:3000",
+        "http://localhost:3333",
         "https://dble.io",
         "https://www.dble.io",
         "https://dbleio-frontend-15e04e0b3c03.herokuapp.com"
@@ -89,6 +92,7 @@ app.include_router(integrations_auth_router)
 app.include_router(feature_requests_router)
 app.include_router(plans_router)
 app.include_router(support_chat_router)
+app.include_router(contact_forms_router)
 
 # Root endpoint
 @app.get("/")
@@ -97,5 +101,7 @@ async def root():
     return {"message": "Video Marketing Simulation API", "version": "1.0.0"}
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8888))
+    uvicorn.run(app, host="0.0.0.0", port=port)
