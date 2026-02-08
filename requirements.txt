@@ -8,7 +8,7 @@ pandas
 # API Framework
 fastapi
 uvicorn[standard]
-pydantic
+pydantic[email]
 
 # Database
 pymongo
