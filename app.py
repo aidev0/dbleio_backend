@@ -22,6 +22,13 @@ from feature_requests import router as feature_requests_router
 from plans import router as plans_router
 from support_chat import router as support_chat_router
 from contact_forms import router as contact_forms_router
+from organizations import router as organizations_router
+from projects import router as projects_router
+from development_specifications import router as development_specifications_router
+from development_workflows import router as development_workflows_router
+from timeline_entries import router as timeline_entries_router
+from custom_workflows import router as custom_workflows_router
+from custom_workflow_timeline import router as custom_workflow_timeline_router
 from auth import APIKeyMiddleware
 
 # Initialize FastAPI app
@@ -93,6 +100,13 @@ app.include_router(feature_requests_router)
 app.include_router(plans_router)
 app.include_router(support_chat_router)
 app.include_router(contact_forms_router)
+app.include_router(organizations_router)
+app.include_router(projects_router)
+app.include_router(development_specifications_router)
+app.include_router(development_workflows_router)
+app.include_router(timeline_entries_router)
+app.include_router(custom_workflows_router)
+app.include_router(custom_workflow_timeline_router)
 
 # Root endpoint
 @app.get("/")

@@ -5,7 +5,7 @@ Users API - Handle user authentication and management with WorkOS
 
 from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from bson import ObjectId
 import os
@@ -29,6 +29,9 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 
 
 # Pydantic Models
+VALID_SUBSCRIPTION_TIERS = ["scale", "platform", "custom", "dble_team"]
+
+
 class User(BaseModel):
     """User model"""
     id: str = Field(alias="_id")
@@ -36,6 +39,9 @@ class User(BaseModel):
     email: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    platform_access: bool = False
+    active_subscription: bool = False
+    subscription_tier: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     last_login: Optional[datetime] = None
@@ -72,6 +78,12 @@ def user_helper(user) -> dict:
         "email": user["email"],
         "first_name": user.get("first_name"),
         "last_name": user.get("last_name"),
+        "roles": user.get("roles", []),
+        "organizations": user.get("organizations", []),
+        "platform_access": user.get("platform_access", False),
+        "active_subscription": user.get("active_subscription", False),
+        "subscription_tier": user.get("subscription_tier"),
+        "active_workflow_limit": user.get("active_workflow_limit"),
         "created_at": user.get("created_at", datetime.utcnow()),
         "updated_at": user.get("updated_at", datetime.utcnow()),
         "last_login": user.get("last_login")
@@ -108,6 +120,11 @@ def get_or_create_user(workos_user_id: str, email: str, first_name: Optional[str
         "email": email,
         "first_name": first_name,
         "last_name": last_name,
+        "roles": [],
+        "active_workflow_limit": None,
+        "platform_access": False,
+        "active_subscription": False,
+        "subscription_tier": None,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
         "last_login": datetime.utcnow()
@@ -201,9 +218,12 @@ async def refresh_token(request: RefreshTokenRequest):
 
 
 @router.get("/me")
-async def get_current_user(workos_user_id: str):
-    """Get current user by WorkOS user ID"""
+async def get_current_user(request: Request, workos_user_id: Optional[str] = None):
+    """Get current user. Uses JWT identity if no query param provided."""
     try:
+        if not workos_user_id:
+            from auth import require_user_id
+            workos_user_id = require_user_id(request)
         user = db.users.find_one({"workos_user_id": workos_user_id})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -232,5 +252,40 @@ async def get_all_users():
     try:
         users = list(db.users.find())
         return [user_helper(user) for user in users]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RoleUpdate(BaseModel):
+    """Request body for updating user roles"""
+    roles: List[str]
+
+
+@router.patch("/{user_id}/roles")
+async def update_user_roles(user_id: str, body: RoleUpdate, request: Request):
+    """Update a user's roles (admin only)"""
+    try:
+        from role_helpers import require_role
+        require_role(request, db, ["admin"])
+
+        valid_roles = ["admin", "fde", "fdm", "qa", "client"]
+        for role in body.roles:
+            if role not in valid_roles:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid role: {role}. Valid roles: {', '.join(valid_roles)}"
+                )
+
+        result = db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"roles": body.roles, "updated_at": datetime.utcnow()}}
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user = db.users.find_one({"_id": ObjectId(user_id)})
+        return user_helper(user)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
