@@ -28,6 +28,7 @@ router = APIRouter(prefix="/api/audiences", tags=["audiences"])
 class Demographics(BaseModel):
     age_range: Optional[List[int]] = None  # [min, max]
     gender: List[str] = Field(default_factory=list)
+    generation: Optional[str] = None
     locations: List[str] = Field(default_factory=list)
     income_level: List[str] = Field(default_factory=list)
     interests: List[str] = Field(default_factory=list)
@@ -36,6 +37,7 @@ class Demographics(BaseModel):
 
 class AudienceCreate(BaseModel):
     brand_id: str
+    campaign_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     demographics: Demographics = Field(default_factory=Demographics)
@@ -44,6 +46,7 @@ class AudienceCreate(BaseModel):
 
 class AudienceUpdate(BaseModel):
     name: Optional[str] = None
+    campaign_id: Optional[str] = None
     description: Optional[str] = None
     demographics: Optional[Demographics] = None
     size_estimate: Optional[int] = None
@@ -55,6 +58,7 @@ def audience_helper(doc) -> dict:
     return {
         "_id": str(doc["_id"]),
         "brand_id": doc["brand_id"],
+        "campaign_id": doc.get("campaign_id"),
         "name": doc["name"],
         "description": doc.get("description"),
         "demographics": doc.get("demographics", {}),
@@ -90,6 +94,7 @@ async def create_audience(body: AudienceCreate, request: Request):
         now = datetime.utcnow()
         doc = {
             "brand_id": body.brand_id,
+            "campaign_id": body.campaign_id,
             "name": body.name,
             "description": body.description,
             "demographics": body.demographics.model_dump() if body.demographics else {},
@@ -108,13 +113,15 @@ async def create_audience(body: AudienceCreate, request: Request):
 
 
 @router.get("")
-async def list_audiences(request: Request, brand_id: Optional[str] = None):
-    """List audiences. Filter by brand_id."""
+async def list_audiences(request: Request, brand_id: Optional[str] = None, campaign_id: Optional[str] = None):
+    """List audiences. Filter by brand_id and/or campaign_id."""
     try:
         from auth import require_user_id
         workos_user_id = require_user_id(request)
 
-        if brand_id:
+        if campaign_id:
+            query = {"campaign_id": campaign_id}
+        elif brand_id:
             _verify_brand_membership(brand_id, workos_user_id)
             query = {"brand_id": brand_id}
         else:
