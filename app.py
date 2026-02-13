@@ -29,6 +29,15 @@ from development_workflows import router as development_workflows_router
 from timeline_entries import router as timeline_entries_router
 from custom_workflows import router as custom_workflows_router
 from custom_workflow_timeline import router as custom_workflow_timeline_router
+from brands import router as brands_router
+from seats import router as seats_router
+from audiences import router as audiences_router
+from brand_assets import router as brand_assets_router
+from content_workflows import router as content_workflows_router
+from content_timeline import router as content_timeline_router
+from dev_workflows import router as dev_workflows_router
+from dev_timeline import router as dev_timeline_router
+from strategies import router as strategies_router
 from auth import APIKeyMiddleware
 
 # Initialize FastAPI app
@@ -107,6 +116,15 @@ app.include_router(development_workflows_router)
 app.include_router(timeline_entries_router)
 app.include_router(custom_workflows_router)
 app.include_router(custom_workflow_timeline_router)
+app.include_router(brands_router)
+app.include_router(seats_router)
+app.include_router(audiences_router)
+app.include_router(brand_assets_router)
+app.include_router(content_workflows_router)
+app.include_router(content_timeline_router)
+app.include_router(dev_workflows_router)
+app.include_router(dev_timeline_router)
+app.include_router(strategies_router)
 
 # Root endpoint
 @app.get("/")

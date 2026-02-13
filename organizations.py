@@ -34,9 +34,6 @@ class OrganizationCreate(BaseModel):
     slug: Optional[str] = None
     description: Optional[str] = None
     url: Optional[str] = None
-    brand_name: Optional[str] = None
-    brand_description: Optional[str] = None
-    product_description: Optional[str] = None
     industry: Optional[str] = None
     logo_url: Optional[str] = None
 
@@ -44,9 +41,6 @@ class OrganizationUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     url: Optional[str] = None
-    brand_name: Optional[str] = None
-    brand_description: Optional[str] = None
-    product_description: Optional[str] = None
     industry: Optional[str] = None
     logo_url: Optional[str] = None
 
@@ -59,7 +53,6 @@ class MemberAdd(BaseModel):
 
 ORG_FIELDS = [
     "name", "slug", "description", "url",
-    "brand_name", "brand_description", "product_description",
     "industry", "logo_url",
     "created_by", "created_at", "updated_at",
 ]
@@ -71,9 +64,6 @@ def organization_helper(org) -> dict:
         "slug": org["slug"],
         "description": org.get("description"),
         "url": org.get("url"),
-        "brand_name": org.get("brand_name"),
-        "brand_description": org.get("brand_description"),
-        "product_description": org.get("product_description"),
         "industry": org.get("industry"),
         "logo_url": org.get("logo_url"),
         "created_by": org.get("created_by"),
@@ -104,9 +94,6 @@ def _sync_org_to_users(org_id: str):
             "organizations.$[elem].slug": fresh["slug"],
             "organizations.$[elem].description": fresh["description"],
             "organizations.$[elem].url": fresh["url"],
-            "organizations.$[elem].brand_name": fresh["brand_name"],
-            "organizations.$[elem].brand_description": fresh["brand_description"],
-            "organizations.$[elem].product_description": fresh["product_description"],
             "organizations.$[elem].industry": fresh["industry"],
             "organizations.$[elem].logo_url": fresh["logo_url"],
             "organizations.$[elem].updated_at": fresh["updated_at"],
@@ -147,9 +134,6 @@ async def create_organization(body: OrganizationCreate, request: Request):
             "slug": slug,
             "description": body.description,
             "url": body.url,
-            "brand_name": body.brand_name,
-            "brand_description": body.brand_description,
-            "product_description": body.product_description,
             "industry": body.industry,
             "logo_url": body.logo_url,
             "created_by": workos_user_id,

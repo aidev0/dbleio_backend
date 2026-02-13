@@ -60,6 +60,7 @@ class Strategy(BaseModel):
 class CampaignCreate(BaseModel):
     name: str
     description: Optional[str] = None
+    brand_id: Optional[str] = None  # FK to brands collection
     platform: Optional[str] = None  # vibe.co, facebook, instagram, linkedin, tiktok, x
     advertiser: Optional[Advertiser] = Field(default_factory=Advertiser)
     campaign_goal: Optional[str] = None  # awareness, traffic, leads, sales, retargeting, app_promotion
@@ -72,6 +73,7 @@ class CampaignCreate(BaseModel):
 class CampaignUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    brand_id: Optional[str] = None
     platform: Optional[str] = None
     advertiser: Optional[Advertiser] = None
     campaign_goal: Optional[str] = None
@@ -88,6 +90,7 @@ class CampaignResponse(BaseModel):
     underscore_id: str = Field(alias="_id", serialization_alias="_id")
     name: str
     description: Optional[str] = None
+    brand_id: Optional[str] = None
     platform: Optional[str] = None
     advertiser: Advertiser = Field(default_factory=Advertiser)
     campaign_goal: Optional[str] = None
@@ -134,6 +137,7 @@ def campaign_helper(campaign) -> dict:
         "_id": str(campaign["_id"]),
         "name": campaign["name"],
         "description": campaign.get("description"),
+        "brand_id": campaign.get("brand_id"),
         "platform": campaign.get("platform"),
         "advertiser": campaign.get("advertiser", {}),
         "campaign_goal": campaign.get("campaign_goal"),
@@ -148,7 +152,7 @@ def campaign_helper(campaign) -> dict:
 
 # Routes
 @router.get("", response_model=List[CampaignResponse])
-async def get_campaigns(request: Request):
+async def get_campaigns(request: Request, brand_id: Optional[str] = None):
     """Get all campaigns for the authenticated user (including campaigns shared with the user)"""
     try:
         # Get user ID from JWT - required for this endpoint
@@ -162,7 +166,11 @@ async def get_campaigns(request: Request):
             ]
         }
 
-        campaigns = db.campaigns.find(query)
+        # Filter by brand_id if provided
+        if brand_id:
+            query["brand_id"] = brand_id
+
+        campaigns = db.campaigns.find(query).sort("created_at", -1)
         return [campaign_helper(campaign) for campaign in campaigns]
     except HTTPException:
         raise

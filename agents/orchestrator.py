@@ -11,7 +11,7 @@ from pymongo import ASCENDING
 from agents.events import log_event
 
 
-# 12-stage pipeline definition
+# 13-stage pipeline definition
 PIPELINE_STAGES = [
     {"name": "spec_intake",    "node_type": "auto",  "job_type": "notify",       "gate": None},
     {"name": "setup",          "node_type": "auto",  "job_type": "setup",        "gate": None},
@@ -25,6 +25,7 @@ PIPELINE_STAGES = [
     {"name": "deployer",       "node_type": "auto",  "job_type": "deploy",       "gate": None},
     {"name": "qa_review",      "node_type": "human", "job_type": None,           "gate": "qa"},
     {"name": "client_review",  "node_type": "human", "job_type": None,           "gate": "client"},
+    {"name": "done",           "node_type": "auto",  "job_type": None,           "gate": None},
 ]
 
 MAX_REVIEW_ITERATIONS = 3
@@ -42,6 +43,7 @@ STAGE_LABELS = {
     "deployer": "Deploy",
     "qa_review": "QA Review",
     "client_review": "Client Review",
+    "done": "Approved & Completed",
 }
 
 
@@ -65,7 +67,7 @@ def create_workflow(
     created_by: str = "",
 ) -> dict:
     """
-    Create a new workflow with 12 nodes (all pending) and queue the first job.
+    Create a new workflow with 13 nodes (all pending) and queue the first job.
     Returns the workflow document.
     """
     now = datetime.utcnow()
@@ -87,7 +89,7 @@ def create_workflow(
     result = db.development_workflows.insert_one(workflow_doc)
     workflow_id = str(result.inserted_id)
 
-    # Create 12 nodes
+    # Create 13 nodes
     for idx, stage in enumerate(PIPELINE_STAGES):
         node_doc = {
             "workflow_id": workflow_id,
@@ -208,11 +210,25 @@ def handle_stage_completion(db, workflow_id: str, completed_stage_name: str, out
         return
 
     next_stage = PIPELINE_STAGES[next_idx]
+    now = datetime.utcnow()
+
+    # Terminal "done" stage — mark completed immediately
+    if next_stage["name"] == "done":
+        db.development_workflow_nodes.update_one(
+            {"workflow_id": workflow_id, "stage_name": "done"},
+            {"$set": {"status": "completed", "started_at": now, "completed_at": now}}
+        )
+        transition_workflow(db, workflow_id, "completed", "done", next_idx)
+        log_event(db, workflow_id, "workflow_completed", "system", "orchestrator",
+                  "Workflow completed successfully")
+        push_timeline_update(db, workflow_id, "done", "completed",
+                             "Workflow completed successfully!")
+        return
 
     # Update node to running
     db.development_workflow_nodes.update_one(
         {"workflow_id": workflow_id, "stage_name": next_stage["name"]},
-        {"$set": {"status": "running", "started_at": datetime.utcnow()}}
+        {"$set": {"status": "running", "started_at": now}}
     )
 
     # If next stage has a human gate, transition and wait
