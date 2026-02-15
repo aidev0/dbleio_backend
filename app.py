@@ -8,37 +8,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 # Import routers
-from campaigns import router as campaigns_router
-from personas import router as personas_router
-from videos import router as videos_router
-from simulations import router as simulations_router, evaluations_router
-from insights import router as insights_router
-from synthesis import router as synthesis_router
-from users import router as users_router
-from chat import router as chat_router
-from tasks import router as tasks_router
-from integrations import router as integrations_router, auth_router as integrations_auth_router
-from feature_requests import router as feature_requests_router
-from plans import router as plans_router
-from support_chat import router as support_chat_router
-from contact_forms import router as contact_forms_router
-from organizations import router as organizations_router
-from projects import router as projects_router
-from development_specifications import router as development_specifications_router
-from development_workflows import router as development_workflows_router
-from timeline_entries import router as timeline_entries_router
-from custom_workflows import router as custom_workflows_router
-from custom_workflow_timeline import router as custom_workflow_timeline_router
-from brands import router as brands_router
-from seats import router as seats_router
-from audiences import router as audiences_router
-from brand_assets import router as brand_assets_router
-from content_workflows import router as content_workflows_router
-from content_timeline import router as content_timeline_router
-from dev_workflows import router as dev_workflows_router
-from dev_timeline import router as dev_timeline_router
-from strategies import router as strategies_router
-from auth import APIKeyMiddleware
+from src.campaigns import router as campaigns_router
+from src.personas import router as personas_router
+from src.videos import router as videos_router
+from src.simulations import router as simulations_router, evaluations_router
+from src.insights import router as insights_router
+from src.synthesis import router as synthesis_router
+from src.users import router as users_router
+from src.chat import router as chat_router
+from src.tasks import router as tasks_router
+from src.integrations import router as integrations_router, auth_router as integrations_auth_router
+from src.feature_requests import router as feature_requests_router
+from src.plans import router as plans_router
+from src.support_chat import router as support_chat_router
+from src.contact_forms import router as contact_forms_router
+from src.organizations import router as organizations_router
+from src.projects import router as projects_router
+from src.development_specifications import router as development_specifications_router
+from src.development_workflows import router as development_workflows_router
+from src.timeline_entries import router as timeline_entries_router
+from src.custom_workflows import router as custom_workflows_router
+from src.custom_workflow_timeline import router as custom_workflow_timeline_router
+from src.brands import router as brands_router
+from src.seats import router as seats_router
+from src.audiences import router as audiences_router
+from src.brand_assets import router as brand_assets_router
+from src.content_workflows import router as content_workflows_router
+from src.content_timeline import router as content_timeline_router
+from src.strategies import router as strategies_router
+from src.auth import APIKeyMiddleware
 
 # Initialize FastAPI app
 app = FastAPI(title="Video Marketing Simulation API")
@@ -122,8 +120,6 @@ app.include_router(audiences_router)
 app.include_router(brand_assets_router)
 app.include_router(content_workflows_router)
 app.include_router(content_timeline_router)
-app.include_router(dev_workflows_router)
-app.include_router(dev_timeline_router)
 app.include_router(strategies_router)
 
 # Root endpoint
