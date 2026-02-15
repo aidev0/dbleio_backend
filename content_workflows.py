@@ -52,6 +52,11 @@ class ChatMessageRequest(BaseModel):
     role: str = "user"
 
 
+class GenerateConceptsRequest(BaseModel):
+    num: int = Field(ge=1, le=50)
+    tone: str
+
+
 # --- Helpers ---
 
 def _workflow_helper(doc) -> dict:
@@ -420,6 +425,118 @@ async def get_user_sessions(workflow_id: str, request: Request):
         from content_generation.state import UserSession
         sessions = UserSession.get_active_sessions(workflow_id)
         return sessions
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Concept Generation ---
+
+@router.post("/{workflow_id}/generate-concepts")
+async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, request: Request):
+    """Use AI to generate content concepts with full workflow context."""
+    try:
+        from auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Gather context
+        brand = db.brands.find_one({"_id": ObjectId(workflow["brand_id"])}) if workflow.get("brand_id") else None
+        campaign = None
+        strategy = None
+        audience = None
+
+        config = workflow.get("config") or {}
+        campaign_id = config.get("campaign_id")
+        if campaign_id:
+            campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+            # Get first strategy for this campaign
+            strategy = db.strategies.find_one({"campaign_id": campaign_id})
+
+        if brand:
+            audience = db.audiences.find_one({"brand_id": workflow["brand_id"]})
+
+        # Build context string
+        context_parts = []
+        if brand:
+            context_parts.append(f"Brand: {brand.get('name', '')} — {brand.get('industry', '')}. {brand.get('description', '')}. Product: {brand.get('product', '')}")
+        if campaign:
+            context_parts.append(f"Campaign: {campaign.get('name', '')}. Goal: {campaign.get('campaign_goal', '')}. Platform: {campaign.get('platform', '')}")
+        if strategy:
+            context_parts.append(f"Strategy: {strategy.get('name', '')}. Budget: {strategy.get('budget_amount', '')} {strategy.get('budget_type', '')}. Objectives: {strategy.get('objectives', '')}")
+        if audience:
+            context_parts.append(f"Audience: {audience.get('name', '')}. Demographics: {audience.get('demographics', '')}. Interests: {audience.get('interests', '')}")
+
+        # Check prior stage outputs from workflow state
+        try:
+            from content_generation.state import WorkflowStateStore
+            state = WorkflowStateStore.load(workflow_id)
+            if state:
+                if state.get("research"):
+                    context_parts.append(f"Research findings: {str(state['research'])[:500]}")
+                if state.get("strategy_assets"):
+                    context_parts.append(f"Strategy assets: {str(state['strategy_assets'])[:500]}")
+        except Exception:
+            pass
+
+        context_str = "\n".join(context_parts) if context_parts else "No additional context available."
+
+        system_prompt = f"""You are a creative content strategist. Generate content concepts based on the following context.
+
+{context_str}
+
+Return a JSON array of exactly {body.num} concepts with tone "{body.tone}". Each concept must have:
+- "title": a catchy concept title
+- "hook": the opening hook (1-2 sentences)
+- "script": a script outline (3-5 bullet points)
+- "messaging": an array of 2-3 key messaging points
+
+Return ONLY valid JSON: {{"concepts": [...]}}"""
+
+        import anthropic
+        ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+
+        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": f"Generate {body.num} content concepts with a {body.tone} tone."}],
+        )
+
+        assistant_text = response.content[0].text
+
+        # Track usage
+        input_tokens = response.usage.input_tokens if response.usage else 0
+        output_tokens = response.usage.output_tokens if response.usage else 0
+        from chat import save_llm_usage
+        save_llm_usage(
+            user_id=workos_user_id,
+            campaign_id=campaign_id,
+            provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            mode="concept_generation",
+        )
+
+        # Parse JSON from response
+        import json
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', assistant_text)
+        if json_match:
+            result = json.loads(json_match.group())
+        else:
+            result = {"concepts": []}
+
+        # Tag each concept with the tone
+        for concept in result.get("concepts", []):
+            concept["tone"] = body.tone
+
+        return result
     except HTTPException:
         raise
     except Exception as e:
