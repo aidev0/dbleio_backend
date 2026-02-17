@@ -94,7 +94,7 @@ class WorkflowState:
         })
 
         # Update workflow
-        from content_generation.workflows.pipeline import get_stage_index
+        from src.content_generation.workflows.pipeline import get_stage_index
         db.content_workflows.update_one(
             {"_id": ObjectId(self.workflow_id)},
             {"$set": {
@@ -139,7 +139,7 @@ class WorkflowState:
         if status in ("completed", "failed"):
             update_fields["completed_at"] = now
 
-        from content_generation.workflows.pipeline import get_stage_index, STAGE_MAP
+        from src.content_generation.workflows.pipeline import get_stage_index, STAGE_MAP
         stage_def = STAGE_MAP.get(stage_key)
 
         db.content_workflow_nodes.update_one(

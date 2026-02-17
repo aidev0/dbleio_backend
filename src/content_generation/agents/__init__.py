@@ -10,6 +10,7 @@ from src.content_generation.agents.strategy import StrategyAgent
 from src.content_generation.agents.scheduling import SchedulingAgent
 from src.content_generation.agents.research import ResearchAgent
 from src.content_generation.agents.concepts import ConceptsAgent
+from src.content_generation.agents.storyboard import StoryboardAgent
 from src.content_generation.agents.content_gen import ContentGenAgent
 from src.content_generation.agents.simulation import SimulationAgent
 from src.content_generation.agents.publish import PublishAgent
@@ -25,7 +26,9 @@ AGENT_REGISTRY = {
     "scheduling_agent": SchedulingAgent,
     "research_agent": ResearchAgent,
     "concepts_agent": ConceptsAgent,
-    "content_gen_agent": ContentGenAgent,
+    "image_gen_agent": ContentGenAgent,  # TODO: create dedicated ImageGenAgent
+    "storyboard_agent": StoryboardAgent,
+    "video_gen_agent": ContentGenAgent,
     "simulation_agent": SimulationAgent,
     "publish_agent": PublishAgent,
     "metrics_agent": MetricsAgent,

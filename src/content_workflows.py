@@ -4,12 +4,13 @@ Content Workflows API routes.
 Exposes the content generation orchestrator to the frontend.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 import os
+import json
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
@@ -55,6 +56,28 @@ class ChatMessageRequest(BaseModel):
 class GenerateConceptsRequest(BaseModel):
     num: int = Field(ge=1, le=50)
     tone: str
+
+
+class GenerateStoryboardRequest(BaseModel):
+    concept_index: int
+    llm_model: Optional[str] = None  # "gemini-pro-3" | "claude-sonnet" | etc.
+    image_model: Optional[str] = None  # default image model for assets
+
+
+class GenerateStoryboardImageRequest(BaseModel):
+    concept_index: int
+    target_type: str  # "character" | "scene"
+    target_id: str
+    image_model: Optional[str] = None
+
+
+class GenerateVideoRequest(BaseModel):
+    storyboard_index: int = 0  # which storyboard to use
+    count: int = 1  # how many creatives
+    model: str  # video model id
+    output_format: Optional[str] = None  # reel_9_16, story_9_16, etc.
+    resolution: Optional[str] = None  # 720p, 1080p, 4k
+    temperature: Optional[float] = None
 
 
 # --- Helpers ---
@@ -541,6 +564,1641 @@ Return ONLY valid JSON: {{"concepts": [...]}}"""
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Image Models ---
+
+@router.get("/models/image")
+async def get_image_models(request: Request):
+    """Get available image generation models."""
+    try:
+        from src.auth import require_user_id
+        require_user_id(request)
+
+        from src.development.models import get_available_image_models
+        return {"models": get_available_image_models()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Storyboard Generation ---
+
+@router.post("/{workflow_id}/generate-storyboard")
+async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest, request: Request):
+    """Generate a storyboard (storyline, characters, scenes) from a concept."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Look up concept from saved stage outputs
+        from src.content_generation.state import WorkflowStateStore
+        state_data = WorkflowStateStore.get_state_data(workflow_id)
+        concepts_output = state_data.get("stage_outputs", {}).get("concepts", {})
+        concepts_list = concepts_output.get("concepts", [])
+
+        # Also check stageSettings saved concepts
+        config = workflow.get("config") or {}
+        stage_settings = config.get("stage_settings", {})
+        generated_concepts = stage_settings.get("concepts", {}).get("generated_concepts", [])
+        if not concepts_list and generated_concepts:
+            concepts_list = generated_concepts
+
+        if body.concept_index < 0 or body.concept_index >= len(concepts_list):
+            raise HTTPException(status_code=400, detail=f"Invalid concept_index {body.concept_index}. Available: 0-{len(concepts_list)-1}")
+
+        concept = concepts_list[body.concept_index]
+        concept_title = concept.get("title", f"Concept {body.concept_index + 1}")
+
+        # Gather brand context
+        brand = db.brands.find_one({"_id": ObjectId(workflow["brand_id"])}) if workflow.get("brand_id") else None
+        brand_context = ""
+        if brand:
+            brand_context = f"Brand: {brand.get('name', '')} — {brand.get('industry', '')}. {brand.get('description', '')}. Product: {brand.get('product', '')}"
+
+        system_prompt = f"""You are a creative director specializing in short-form video content. Generate a detailed storyboard for this concept.
+
+{brand_context}
+
+Concept: {json.dumps(concept)}
+
+Create a detailed storyboard that breaks this concept into filmable scenes. You must:
+1. First define all CHARACTERS with detailed, consistent visual descriptions. Each character's description must be specific enough to generate consistent AI images (age, ethnicity, build, hair, clothing, etc.)
+2. Then create SCENES that reference these characters. Each scene's image_prompt should incorporate the character's visual descriptions for consistency.
+3. Give each scene a shot type (close-up, medium, wide, over-shoulder, etc.) and duration hint.
+
+Return ONLY valid JSON in this exact format:
+{{
+  "storyline": "A 1-2 sentence narrative summary",
+  "total_cuts": <number of scenes>,
+  "characters": [
+    {{
+      "id": "char_0",
+      "name": "Character name",
+      "description": "Detailed visual description for consistency across scenes",
+      "image_prompt": "Portrait photo prompt optimized for AI image generation"
+    }}
+  ],
+  "scenes": [
+    {{
+      "id": "scene_0",
+      "scene_number": 1,
+      "title": "Scene title",
+      "description": "What happens in this scene",
+      "shot_type": "close-up",
+      "duration_hint": "3s",
+      "character_ids": ["char_0"],
+      "image_prompt": "Detailed image generation prompt incorporating character descriptions"
+    }}
+  ]
+}}"""
+
+        llm_model = body.llm_model or "gemini-pro-3"
+        user_prompt = f"Generate a detailed storyboard for the concept: {concept_title}"
+        campaign_id = config.get("campaign_id")
+
+        if llm_model.startswith("gemini"):
+            # Use Google Gemini
+            import google.generativeai as genai
+            GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+            if not GOOGLE_API_KEY:
+                raise HTTPException(status_code=500, detail="Google API key not configured")
+            genai.configure(api_key=GOOGLE_API_KEY)
+
+            # Map model shorthand to actual Gemini model ID
+            gemini_model_map = {
+                "gemini-pro-3": "gemini-3-pro-preview",
+                "gemini-flash-3": "gemini-3-flash-preview",
+                "gemini-flash": "gemini-3-flash-preview",
+                "gemini-pro": "gemini-3-pro-preview",
+            }
+            gemini_model_id = gemini_model_map.get(llm_model, llm_model)
+
+            model = genai.GenerativeModel(gemini_model_id)
+            gemini_messages = [
+                {"role": "user", "parts": [{"text": system_prompt}]},
+                {"role": "model", "parts": [{"text": "I understand. I will generate the storyboard as requested."}]},
+                {"role": "user", "parts": [{"text": user_prompt}]},
+            ]
+            response = model.generate_content(
+                gemini_messages,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=4096,
+                    temperature=0.7
+                )
+            )
+            assistant_text = response.text
+            input_tokens = getattr(response, 'usage_metadata', None)
+            input_tokens = input_tokens.prompt_token_count if input_tokens and hasattr(input_tokens, 'prompt_token_count') else 0
+            output_tokens = getattr(response, 'usage_metadata', None)
+            output_tokens = output_tokens.candidates_token_count if output_tokens and hasattr(output_tokens, 'candidates_token_count') else 0
+
+            from src.chat import save_llm_usage
+            save_llm_usage(
+                user_id=workos_user_id,
+                campaign_id=campaign_id,
+                provider="google",
+                model_name=gemini_model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                mode="storyboard_generation",
+            )
+
+        elif llm_model.startswith("gpt"):
+            # Use OpenAI
+            from openai import OpenAI as OpenAIClient
+            OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+            if not OPENAI_API_KEY:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+            openai_model_map = {
+                "gpt-4o": "gpt-4o",
+                "gpt-5.2": "gpt-4o",
+            }
+            openai_model_id = openai_model_map.get(llm_model, llm_model)
+
+            openai_client = OpenAIClient(api_key=OPENAI_API_KEY)
+            response = openai_client.chat.completions.create(
+                model=openai_model_id,
+                max_tokens=4096,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            assistant_text = response.choices[0].message.content
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+
+            from src.chat import save_llm_usage
+            save_llm_usage(
+                user_id=workos_user_id,
+                campaign_id=campaign_id,
+                provider="openai",
+                model_name=openai_model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                mode="storyboard_generation",
+            )
+
+        else:
+            # Default: Anthropic Claude
+            import anthropic
+            ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+            if not ANTHROPIC_API_KEY:
+                raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+
+            claude_model_map = {
+                "claude-4.5-sonnet": "claude-sonnet-4-5-20250929",
+                "claude-sonnet": "claude-sonnet-4-5-20250929",
+                "claude-opus": "claude-opus-4-6",
+            }
+            claude_model_id = claude_model_map.get(llm_model, "claude-sonnet-4-5-20250929")
+
+            anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = anthropic_client.messages.create(
+                model=claude_model_id,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            assistant_text = response.content[0].text
+            input_tokens = response.usage.input_tokens if response.usage else 0
+            output_tokens = response.usage.output_tokens if response.usage else 0
+
+            from src.chat import save_llm_usage
+            save_llm_usage(
+                user_id=workos_user_id,
+                campaign_id=campaign_id,
+                provider="anthropic",
+                model_name=claude_model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                mode="storyboard_generation",
+            )
+
+        # Parse JSON from response
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', assistant_text)
+        if json_match:
+            storyboard_data = json.loads(json_match.group())
+        else:
+            raise HTTPException(status_code=500, detail="Failed to parse storyboard from AI response")
+
+        # Add metadata to each character/scene
+        image_model = body.image_model or "google/nano-banana-pro"
+        for char in storyboard_data.get("characters", []):
+            char["image_url"] = None
+            char["gs_uri"] = None
+            char["image_model"] = image_model
+        for scene in storyboard_data.get("scenes", []):
+            scene["image_url"] = None
+            scene["gs_uri"] = None
+            scene["image_model"] = image_model
+
+        # Build the storyboard entry
+        storyboard_entry = {
+            "concept_index": body.concept_index,
+            "concept_title": concept_title,
+            "storyline": storyboard_data.get("storyline", ""),
+            "total_cuts": storyboard_data.get("total_cuts", len(storyboard_data.get("scenes", []))),
+            "characters": storyboard_data.get("characters", []),
+            "scenes": storyboard_data.get("scenes", []),
+            "status": "storyline_ready",
+        }
+
+        # Load existing storyboard node output_data and update
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        existing_output = storyboard_node.get("output_data", {}) if storyboard_node else {}
+        existing_storyboards = existing_output.get("storyboards", [])
+
+        # Replace or add storyboard for this concept_index
+        found = False
+        for i, sb in enumerate(existing_storyboards):
+            if sb.get("concept_index") == body.concept_index:
+                existing_storyboards[i] = storyboard_entry
+                found = True
+                break
+        if not found:
+            existing_storyboards.append(storyboard_entry)
+
+        output_data = {
+            "storyboards": existing_storyboards,
+            "status": "storyboard_ready",
+        }
+
+        # Save to node output_data
+        from src.content_generation.state import WorkflowState
+        ws = WorkflowState(workflow_id)
+        ws.update_node("storyboard", "completed", output_data=output_data)
+
+        # Save to WorkflowStateStore
+        state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
+        WorkflowStateStore.save(workflow_id, state_data)
+
+        return storyboard_entry
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class UpdateSceneRequest(BaseModel):
+    storyboard_index: int = 0
+    scene_id: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    shot_type: Optional[str] = None
+    duration_hint: Optional[str] = None
+    image_prompt: Optional[str] = None
+
+
+@router.patch("/{workflow_id}/storyboard-scene")
+async def update_storyboard_scene(
+    workflow_id: str,
+    body: UpdateSceneRequest,
+    request: Request,
+):
+    """Update a single scene's editable fields in a storyboard."""
+    try:
+        from src.auth import get_workos_user_id
+        workos_user_id = get_workos_user_id(request)
+        if workos_user_id:
+            _verify_workflow_access(workflow_id, workos_user_id)
+        else:
+            workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
+            if not workflow:
+                raise HTTPException(status_code=404, detail="Workflow not found")
+
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if not storyboard_node or not storyboard_node.get("output_data"):
+            raise HTTPException(status_code=400, detail="No storyboard found.")
+
+        output_data = storyboard_node["output_data"]
+        storyboards = output_data.get("storyboards", [])
+
+        if body.storyboard_index < 0 or body.storyboard_index >= len(storyboards):
+            raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {body.storyboard_index}")
+
+        storyboard = storyboards[body.storyboard_index]
+        scenes = storyboard.get("scenes", [])
+
+        scene = next((s for s in scenes if s.get("id") == body.scene_id), None)
+        if not scene:
+            raise HTTPException(status_code=404, detail=f"Scene {body.scene_id} not found")
+
+        # Update only provided fields
+        if body.title is not None:
+            scene["title"] = body.title
+        if body.description is not None:
+            scene["description"] = body.description
+        if body.shot_type is not None:
+            scene["shot_type"] = body.shot_type
+        if body.duration_hint is not None:
+            scene["duration_hint"] = body.duration_hint
+        if body.image_prompt is not None:
+            scene["image_prompt"] = body.image_prompt
+
+        db.content_workflow_nodes.update_one(
+            {"_id": storyboard_node["_id"]},
+            {"$set": {
+                "output_data": output_data,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+        return {"ok": True, "scene": scene}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{workflow_id}/generate-storyboard-image")
+async def generate_storyboard_image(
+    workflow_id: str,
+    body: GenerateStoryboardImageRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Kick off async image generation for a storyboard character or scene."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Load storyboard from node output_data
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if not storyboard_node or not storyboard_node.get("output_data"):
+            raise HTTPException(status_code=400, detail="No storyboard found. Generate a storyboard first.")
+
+        output_data = storyboard_node["output_data"]
+        storyboards = output_data.get("storyboards", [])
+
+        # Find the storyboard for this concept_index
+        storyboard = None
+        for sb in storyboards:
+            if sb.get("concept_index") == body.concept_index:
+                storyboard = sb
+                break
+        if not storyboard:
+            raise HTTPException(status_code=400, detail=f"No storyboard for concept_index {body.concept_index}")
+
+        # Find the target (character or scene)
+        target = None
+        image_prompt = None
+        if body.target_type == "character":
+            for char in storyboard.get("characters", []):
+                if char.get("id") == body.target_id:
+                    target = char
+                    image_prompt = char.get("image_prompt", "")
+                    break
+        elif body.target_type == "scene":
+            for scene in storyboard.get("scenes", []):
+                if scene.get("id") == body.target_id:
+                    target = scene
+                    # Character-first enforcement: check all characters in scene have images
+                    char_ids = scene.get("character_ids", [])
+                    char_map = {c["id"]: c for c in storyboard.get("characters", [])}
+                    for cid in char_ids:
+                        char = char_map.get(cid)
+                        if char and not char.get("image_url"):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Generate character '{char.get('name', cid)}' image first for visual consistency."
+                            )
+
+                    # Enrich scene prompt with character visual descriptions
+                    char_descriptions = []
+                    for cid in char_ids:
+                        char = char_map.get(cid)
+                        if char:
+                            char_descriptions.append(f"{char.get('name', '')}: {char.get('description', '')}")
+
+                    base_prompt = scene.get("image_prompt", "")
+                    if char_descriptions:
+                        image_prompt = f"{base_prompt}. Characters in scene: {'; '.join(char_descriptions)}"
+                    else:
+                        image_prompt = base_prompt
+                    break
+        else:
+            raise HTTPException(status_code=400, detail="target_type must be 'character' or 'scene'")
+
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Target {body.target_id} not found in storyboard")
+
+        if not image_prompt:
+            raise HTTPException(status_code=400, detail="No image_prompt found for target")
+
+        image_model = body.image_model or target.get("image_model", "google/nano-banana-pro")
+
+        # Create background task
+        import uuid
+        from src.task_manager import task_manager
+        task_id = f"storyboard_img_{workflow_id}_{body.target_id}"
+
+        task_manager.create_task(
+            task_id,
+            "storyboard_image_generation",
+            metadata={
+                "workflow_id": workflow_id,
+                "concept_index": body.concept_index,
+                "target_type": body.target_type,
+                "target_id": body.target_id,
+                "image_model": image_model,
+            }
+        )
+
+        background_tasks.add_task(
+            _generate_storyboard_image_background,
+            task_id,
+            workflow_id,
+            body.concept_index,
+            body.target_type,
+            body.target_id,
+            image_prompt,
+            image_model,
+        )
+
+        return {"task_id": task_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/storyboard-image-status/{task_id}")
+async def get_storyboard_image_status(workflow_id: str, task_id: str, request: Request):
+    """Poll image generation status."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        from src.task_manager import task_manager
+        task = task_manager.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        return task
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _generate_storyboard_image_background(
+    task_id: str,
+    workflow_id: str,
+    concept_index: int,
+    target_type: str,
+    target_id: str,
+    image_prompt: str,
+    image_model: str,
+):
+    """Background task: call Replicate API, upload to GCS, update node."""
+    import httpx
+    import asyncio
+    from src.task_manager import task_manager, TaskStatus
+
+    try:
+        task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=10, message="Starting image generation...")
+
+        REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+        if not REPLICATE_API_TOKEN:
+            raise Exception("REPLICATE_API_TOKEN not configured")
+
+        # Map model shorthand to Replicate model string
+        model_string = image_model
+        if "/" not in image_model:
+            model_map = {
+                "nano-banana": "google/nano-banana",
+                "nano-banana-pro": "google/nano-banana-pro",
+                "flux-schnell": "black-forest-labs/flux-schnell",
+                "flux-pro": "black-forest-labs/flux-1.1-pro",
+                "flux-dev": "black-forest-labs/flux-dev",
+                "sdxl": "stability-ai/sdxl",
+            }
+            model_string = model_map.get(image_model, f"google/{image_model}")
+
+        # Call Replicate API
+        async with httpx.AsyncClient(timeout=120) as client:
+            # Create prediction
+            create_resp = await client.post(
+                f"https://api.replicate.com/v1/models/{model_string}/predictions",
+                headers={
+                    "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": {"prompt": image_prompt}},
+            )
+            if create_resp.status_code != 201:
+                raise Exception(f"Replicate API error: {create_resp.status_code} {create_resp.text}")
+
+            prediction = create_resp.json()
+            prediction_url = prediction.get("urls", {}).get("get")
+            if not prediction_url:
+                raise Exception("No prediction URL returned from Replicate")
+
+            task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=30, message="Generating image...")
+
+            # Poll for completion
+            for _ in range(120):  # Max 4 minutes
+                await asyncio.sleep(2)
+                poll_resp = await client.get(
+                    prediction_url,
+                    headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                )
+                poll_data = poll_resp.json()
+                status = poll_data.get("status")
+
+                if status == "succeeded":
+                    output = poll_data.get("output")
+                    if isinstance(output, list) and len(output) > 0:
+                        image_url_remote = output[0]
+                    elif isinstance(output, str):
+                        image_url_remote = output
+                    else:
+                        raise Exception(f"Unexpected Replicate output format: {output}")
+                    break
+                elif status == "failed":
+                    error = poll_data.get("error", "Unknown error")
+                    raise Exception(f"Replicate prediction failed: {error}")
+            else:
+                raise Exception("Image generation timed out")
+
+            task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=60, message="Uploading to storage...")
+
+            # Download image from Replicate's temporary URL
+            img_resp = await client.get(image_url_remote)
+            if img_resp.status_code != 200:
+                raise Exception(f"Failed to download image from Replicate: {img_resp.status_code}")
+            image_bytes = img_resp.content
+
+        # Upload to GCS
+        from google.cloud import storage as gcs_storage
+        from google.oauth2 import service_account
+
+        GCS_BUCKET = os.getenv('GCS_BUCKET', 'video-marketing-simulation')
+        service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+        if not service_account_json:
+            raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+
+        credentials_dict = json.loads(service_account_json)
+        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+        storage_client = gcs_storage.Client(credentials=credentials, project=credentials.project_id)
+        bucket = storage_client.bucket(GCS_BUCKET)
+
+        blob_path = f"storyboards/{workflow_id}/{target_id}.png"
+        blob = bucket.blob(blob_path)
+        blob.upload_from_string(image_bytes, content_type="image/png")
+
+        gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
+        signed_url = blob.generate_signed_url(
+            version="v2",
+            expiration=timedelta(days=14),
+            method="GET",
+            credentials=credentials,
+        )
+
+        task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=80, message="Updating storyboard...")
+
+        # Update the storyboard node output_data
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if storyboard_node:
+            output = storyboard_node.get("output_data", {})
+            storyboards = output.get("storyboards", [])
+            for sb in storyboards:
+                if sb.get("concept_index") == concept_index:
+                    collection = sb.get("characters" if target_type == "character" else "scenes", [])
+                    for item in collection:
+                        if item.get("id") == target_id:
+                            item["image_url"] = signed_url
+                            item["gs_uri"] = gs_uri
+                            item["image_model"] = image_model
+                            break
+
+                    # Check if all images are done for this storyboard
+                    all_chars_done = all(c.get("image_url") for c in sb.get("characters", []))
+                    all_scenes_done = all(s.get("image_url") for s in sb.get("scenes", []))
+                    if all_chars_done and all_scenes_done:
+                        sb["status"] = "complete"
+                    elif any(c.get("image_url") for c in sb.get("characters", [])) or any(s.get("image_url") for s in sb.get("scenes", [])):
+                        sb["status"] = "images_generating"
+                    break
+
+            # Save updated node
+            db.content_workflow_nodes.update_one(
+                {"_id": storyboard_node["_id"]},
+                {"$set": {"output_data": output, "updated_at": datetime.utcnow()}},
+            )
+
+            # Also update WorkflowStateStore
+            from src.content_generation.state import WorkflowStateStore
+            state_data = WorkflowStateStore.get_state_data(workflow_id)
+            state_data.setdefault("stage_outputs", {})["storyboard"] = output
+            WorkflowStateStore.save(workflow_id, state_data)
+
+        task_manager.update_task(
+            task_id,
+            status=TaskStatus.COMPLETED,
+            progress=100,
+            message="Image generated successfully",
+            result={"image_url": signed_url, "gs_uri": gs_uri},
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        task_manager.update_task(
+            task_id,
+            status=TaskStatus.FAILED,
+            message=str(e),
+            error=str(e),
+        )
+
+
+# --- Video Generation ---
+
+@router.post("/{workflow_id}/generate-video")
+async def generate_video(
+    workflow_id: str,
+    body: GenerateVideoRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Generate video(s) from storyboard scenes using the specified model."""
+    try:
+        from src.auth import get_workos_user_id
+        workos_user_id = get_workos_user_id(request)
+        if workos_user_id:
+            workflow = _verify_workflow_access(workflow_id, workos_user_id)
+        else:
+            # API key auth — load workflow directly
+            workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
+            if not workflow:
+                raise HTTPException(status_code=404, detail="Workflow not found")
+
+        # Load storyboard from node output_data
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if not storyboard_node or not storyboard_node.get("output_data"):
+            raise HTTPException(status_code=400, detail="No storyboard found. Generate a storyboard first.")
+
+        output_data = storyboard_node["output_data"]
+        storyboards = output_data.get("storyboards", [])
+
+        if body.storyboard_index < 0 or body.storyboard_index >= len(storyboards):
+            raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {body.storyboard_index}. Available: 0-{len(storyboards)-1}")
+
+        storyboard = storyboards[body.storyboard_index]
+        scenes = storyboard.get("scenes", [])
+        characters = storyboard.get("characters", [])
+        storyline = storyboard.get("storyline", "")
+
+        # Create a task for tracking
+        import uuid
+        task_id = str(uuid.uuid4())
+
+        # Build initial per-set tracking dict
+        sets_tracking = {str(i): {"status": "processing", "stitched_url": None} for i in range(body.count)}
+
+        # Store the video generation job
+        job = {
+            "task_id": task_id,
+            "workflow_id": workflow_id,
+            "storyboard_index": body.storyboard_index,
+            "model": body.model,
+            "count": body.count,
+            "output_format": body.output_format,
+            "resolution": body.resolution,
+            "temperature": body.temperature,
+            "status": "pending",
+            "scenes_count": len(scenes),
+            "characters_count": len(characters),
+            "sets": sets_tracking,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        db.video_generation_jobs.insert_one(job)
+
+        # Run generation in background
+        background_tasks.add_task(
+            _run_video_generation,
+            workflow_id=workflow_id,
+            task_id=task_id,
+            storyboard=storyboard,
+            model=body.model,
+            count=body.count,
+            output_format=body.output_format,
+            resolution=body.resolution,
+            temperature=body.temperature,
+        )
+
+        return {"task_id": task_id, "status": "pending", "model": body.model, "count": body.count}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/video-status/{task_id}")
+async def get_video_status(workflow_id: str, task_id: str, request: Request):
+    """Check status of a video generation job. Polls external APIs for pending videos."""
+    import httpx
+
+    try:
+        from src.auth import get_workos_user_id
+        get_workos_user_id(request)  # validate if JWT present, but allow API key
+
+        job = db.video_generation_jobs.find_one({"task_id": task_id, "workflow_id": workflow_id})
+        if not job:
+            raise HTTPException(status_code=404, detail="Video generation job not found")
+
+        # If job is still processing, poll external APIs for each pending video
+        if job.get("status") == "processing":
+            videos = job.get("videos", [])
+            updated = False
+
+            async with httpx.AsyncClient(timeout=30) as http:
+                for v in videos:
+                    # Process completed OpenAI videos that still need GCS upload
+                    if v.get("status") == "completed" and v.get("provider") == "openai" and (v.get("video_url") or "").startswith("openai://"):
+                        try:
+                            from openai import OpenAI as _OpenAI
+                            openai_client = _OpenAI()
+                            video_id = v.get("external_id")
+                            gcs_url = await _download_and_upload_openai_video(
+                                openai_client, video_id, workflow_id, task_id, v["index"],
+                            )
+                            v["video_url"] = gcs_url
+                            updated = True
+                            _write_scene_variation_to_node(
+                                workflow_id, v["scene_number"], gcs_url, job.get("model", "sora-2"), task_id,
+                            )
+                        except Exception as dl_err:
+                            print(f"Failed to download/upload existing OpenAI video {v.get('external_id')}: {dl_err}")
+
+                    if v.get("status") != "pending":
+                        continue
+
+                    try:
+                        provider = v.get("provider", "replicate")
+
+                        if provider == "openai":
+                            # Poll OpenAI Sora video
+                            import asyncio
+                            from openai import OpenAI as _OpenAI
+                            openai_client = _OpenAI()
+                            video_id = v.get("external_id")
+                            if not video_id:
+                                continue
+                            loop = asyncio.get_event_loop()
+                            oai_video = await loop.run_in_executor(
+                                None,
+                                lambda vid=video_id: openai_client.videos.retrieve(vid),
+                            )
+                            ext_status = oai_video.status
+
+                            if ext_status == "completed":
+                                # Download from OpenAI, upload to GCS, write variation immediately
+                                try:
+                                    gcs_url = await _download_and_upload_openai_video(
+                                        openai_client, video_id, workflow_id, task_id, v["index"],
+                                    )
+                                    v["video_url"] = gcs_url
+                                except Exception as dl_err:
+                                    print(f"Failed to download/upload OpenAI video {video_id}: {dl_err}")
+                                    v["video_url"] = f"openai://videos/{video_id}/content"
+                                v["status"] = "completed"
+                                updated = True
+                                # Write individual scene variation to node immediately
+                                _write_scene_variation_to_node(
+                                    workflow_id, v["scene_number"], v.get("video_url"), job.get("model", "sora-2"), task_id,
+                                )
+                            elif ext_status == "failed":
+                                v["status"] = "failed"
+                                v["error"] = getattr(oai_video, "error", None) or "OpenAI Sora generation failed"
+                                updated = True
+                            # else: still queued/in_progress, keep polling
+
+                        elif provider == "google":
+                            # Poll Google Veo operation
+                            GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+                            operation_name = v.get("external_id")
+                            if not GOOGLE_API_KEY or not operation_name:
+                                continue
+                            poll_resp = await http.get(
+                                f"https://generativelanguage.googleapis.com/v1beta/{operation_name}",
+                                headers={"x-goog-api-key": GOOGLE_API_KEY},
+                            )
+                            poll_data = poll_resp.json()
+
+                            if poll_data.get("done"):
+                                response = poll_data.get("response", {})
+                                gen_resp = response.get("generateVideoResponse", response)
+                                samples = gen_resp.get("generatedSamples", [])
+                                video_uri = None
+                                if samples:
+                                    video_uri = samples[0].get("video", {}).get("uri")
+                                if video_uri:
+                                    # Use Google's temporary URL directly (valid ~2 days)
+                                    # Append API key for authenticated download
+                                    v["video_url"] = f"{video_uri}&key={GOOGLE_API_KEY}"
+                                    v["status"] = "completed"
+                                    updated = True
+                                    _write_scene_variation_to_node(
+                                        workflow_id, v["scene_number"], v["video_url"], job.get("model", ""), task_id,
+                                    )
+                                else:
+                                    v["status"] = "failed"
+                                    v["error"] = "No video URI in response"
+                                    updated = True
+                            elif poll_data.get("error"):
+                                v["status"] = "failed"
+                                v["error"] = str(poll_data["error"])
+                                updated = True
+
+                        else:
+                            # Poll Replicate prediction
+                            REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+                            prediction_url = v.get("external_id")
+                            if not REPLICATE_API_TOKEN or not prediction_url:
+                                continue
+                            poll_resp = await http.get(
+                                prediction_url,
+                                headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                            )
+                            poll_data = poll_resp.json()
+                            ext_status = poll_data.get("status")
+
+                            if ext_status == "succeeded":
+                                output = poll_data.get("output")
+                                if isinstance(output, list) and len(output) > 0:
+                                    v["video_url"] = output[0]
+                                elif isinstance(output, str):
+                                    v["video_url"] = output
+                                v["status"] = "completed"
+                                updated = True
+                                _write_scene_variation_to_node(
+                                    workflow_id, v["scene_number"], v.get("video_url"), job.get("model", ""), task_id,
+                                )
+                            elif ext_status == "failed":
+                                v["status"] = "failed"
+                                v["error"] = poll_data.get("error", "Unknown error")
+                                updated = True
+
+                    except Exception as poll_err:
+                        print(f"Error polling video {v.get('index')}: {poll_err}")
+
+            if updated:
+                db.video_generation_jobs.update_one(
+                    {"task_id": task_id},
+                    {"$set": {
+                        "videos": videos,
+                        "updated_at": datetime.utcnow(),
+                    }},
+                )
+                job["videos"] = videos
+
+                # Check each set: if all scenes completed, trigger stitching
+                import asyncio
+                sets = job.get("sets", {})
+                for set_idx_str, set_info in sets.items():
+                    if set_info.get("status") != "processing":
+                        continue
+                    set_idx = int(set_idx_str)
+                    set_videos = [v for v in videos if v.get("set_index") == set_idx]
+                    if not set_videos:
+                        continue
+                    all_scenes_done = all(v.get("status") in ("completed", "failed") for v in set_videos)
+                    any_scene_completed = any(v.get("status") == "completed" for v in set_videos)
+                    if all_scenes_done and any_scene_completed:
+                        # Mark set as stitching and kick off background stitch
+                        sets[set_idx_str]["status"] = "stitching"
+                        db.video_generation_jobs.update_one(
+                            {"task_id": task_id},
+                            {"$set": {f"sets.{set_idx_str}.status": "stitching", "updated_at": datetime.utcnow()}},
+                        )
+                        asyncio.ensure_future(_stitch_scene_videos(workflow_id, task_id, set_idx, videos, job.get("model", "")))
+                    elif all_scenes_done and not any_scene_completed:
+                        # All scenes failed for this set
+                        sets[set_idx_str]["status"] = "failed"
+                        db.video_generation_jobs.update_one(
+                            {"task_id": task_id},
+                            {"$set": {f"sets.{set_idx_str}.status": "failed", "updated_at": datetime.utcnow()}},
+                        )
+
+                job["sets"] = sets
+
+        # Build scene progress per set for the response
+        sets_info = job.get("sets", {})
+        scene_progress = {}
+        for set_idx_str, set_info in sets_info.items():
+            set_videos = [v for v in job.get("videos", []) if v.get("set_index") == int(set_idx_str)]
+            completed_scenes = sum(1 for v in set_videos if v.get("status") == "completed")
+            total_scenes = len(set_videos)
+            scene_progress[set_idx_str] = {
+                "completed_scenes": completed_scenes,
+                "total_scenes": total_scenes,
+                "status": set_info.get("status", "processing"),
+                "stitched_url": set_info.get("stitched_url"),
+            }
+
+        return {
+            "task_id": job["task_id"],
+            "status": job.get("status", "unknown"),
+            "model": job.get("model"),
+            "count": job.get("count"),
+            "videos": job.get("videos", []),
+            "sets": sets_info,
+            "scene_progress": scene_progress,
+            "error": job.get("error"),
+            "created_at": str(job.get("created_at", "")),
+            "updated_at": str(job.get("updated_at", "")),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}/video-variation/{variation_id}")
+async def delete_video_variation(workflow_id: str, variation_id: str, request: Request):
+    """Delete a single video variation by its id."""
+    try:
+        from src.auth import get_workos_user_id
+        get_workos_user_id(request)
+
+        result = db.content_workflow_nodes.update_one(
+            {"workflow_id": workflow_id, "stage_key": "video_generation"},
+            {"$pull": {"output_data.variations": {"id": variation_id}}},
+        )
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Variation not found")
+        return {"ok": True, "deleted_variation_id": variation_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/video-jobs")
+async def list_video_jobs(workflow_id: str, request: Request):
+    """List all video generation jobs for a workflow."""
+    try:
+        from src.auth import get_workos_user_id
+        get_workos_user_id(request)
+
+        jobs = list(db.video_generation_jobs.find({"workflow_id": workflow_id}).sort("created_at", -1))
+        result = []
+        for j in jobs:
+            videos = j.get("videos", [])
+            done = sum(1 for v in videos if v.get("status") == "completed")
+            failed = sum(1 for v in videos if v.get("status") == "failed")
+            pending = len(videos) - done - failed
+            result.append({
+                "task_id": j.get("task_id", ""),
+                "model": j.get("model", ""),
+                "status": j.get("status", ""),
+                "scenes_total": len(videos),
+                "scenes_done": done,
+                "scenes_failed": failed,
+                "scenes_pending": pending,
+                "created_at": str(j.get("created_at", "")),
+            })
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}/video-job/{task_id}", status_code=200)
+async def delete_video_job(workflow_id: str, task_id: str, request: Request):
+    """Delete a video generation job and its scene variations."""
+    try:
+        from src.auth import get_workos_user_id
+        get_workos_user_id(request)
+
+        job = db.video_generation_jobs.find_one({"task_id": task_id, "workflow_id": workflow_id})
+        if not job:
+            raise HTTPException(status_code=404, detail="Video generation job not found")
+
+        # Remove the job document
+        db.video_generation_jobs.delete_one({"task_id": task_id, "workflow_id": workflow_id})
+
+        # Remove scene variations for this task_id from the node
+        db.content_workflow_nodes.update_one(
+            {"workflow_id": workflow_id, "stage_key": "video_generation"},
+            {"$pull": {"output_data.variations": {"task_id": task_id}}},
+        )
+
+        return {"ok": True, "deleted_task_id": task_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_video_generation(
+    workflow_id: str,
+    task_id: str,
+    storyboard: dict,
+    model: str,
+    count: int,
+    output_format: str | None,
+    resolution: str | None,
+    temperature: float | None,
+):
+    """Background task: submit video generation jobs to external APIs (non-blocking)."""
+    import httpx
+    import asyncio
+
+    try:
+        db.video_generation_jobs.update_one(
+            {"task_id": task_id},
+            {"$set": {"status": "running", "updated_at": datetime.utcnow()}},
+        )
+
+        # Resolve model config from VIDEO_MODELS registry
+        from src.development.models import VIDEO_MODELS
+        model_key = model.replace(".", "-")
+        model_cfg = VIDEO_MODELS.get(model_key) or VIDEO_MODELS.get(model)
+
+        is_google_direct = model_cfg and getattr(model_cfg, "platform", "") == "direct" and getattr(model_cfg, "provider", "") == "google"
+        is_openai_direct = model_cfg and getattr(model_cfg, "platform", "") == "direct" and getattr(model_cfg, "provider", "") == "openai"
+
+        scenes = storyboard.get("scenes", [])
+        characters = storyboard.get("characters", [])
+        storyline = storyboard.get("storyline", "")
+        videos = []
+        global_idx = 0
+
+        # Determine provider string
+        if is_openai_direct:
+            provider_str = "openai"
+        elif is_google_direct:
+            provider_str = "google"
+        else:
+            provider_str = "replicate"
+
+        GOOGLE_BATCH_SIZE = 3
+        GOOGLE_POLL_INTERVAL = 10  # seconds between poll checks
+
+        async with httpx.AsyncClient(timeout=60) as http:
+            for set_idx in range(count):
+                # Build all scene entries first
+                scene_entries = []
+                for j, scene in enumerate(scenes):
+                    scene_chars = [c for c in characters if c.get("id") in scene.get("character_ids", [])]
+                    char_desc = ", ".join([f"{c['name']}: {c.get('description', '')}" for c in scene_chars])
+                    duration_hint = scene.get("duration_hint", "5s")
+
+                    scene_prompt = f"Storyline context: {storyline}\n\n"
+                    scene_prompt += f"Generate ONLY this specific scene as a single video clip:\n"
+                    scene_prompt += f"Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
+                    if char_desc:
+                        scene_prompt += f" Characters: {char_desc}."
+                    if scene.get("shot_type"):
+                        scene_prompt += f" Shot type: {scene['shot_type']}."
+                    scene_prompt += f"\n\nIMPORTANT: This video clip MUST be exactly {duration_hint} long."
+
+                    scene_entries.append({
+                        "index": global_idx + j,
+                        "set_index": set_idx,
+                        "scene_index": j,
+                        "scene_number": scene.get("scene_number", j + 1),
+                        "model": model,
+                        "prompt": scene_prompt,
+                        "duration_hint": duration_hint,
+                        "status": "pending",
+                        "video_url": None,
+                        "external_id": None,
+                        "provider": provider_str,
+                    })
+
+                if is_google_direct:
+                    # Submit in batches, wait for each batch to complete before next
+                    for batch_start in range(0, len(scene_entries), GOOGLE_BATCH_SIZE):
+                        batch = scene_entries[batch_start:batch_start + GOOGLE_BATCH_SIZE]
+
+                        # Submit this batch
+                        for entry in batch:
+                            try:
+                                external_id = await _submit_google_veo(http, entry["prompt"], model_cfg, resolution, output_format)
+                                entry["external_id"] = external_id
+                            except Exception as submit_err:
+                                entry["status"] = "failed"
+                                entry["error"] = str(submit_err)
+                            await asyncio.sleep(2)  # small gap between submissions within batch
+
+                        # Save progress so UI can see submitted scenes
+                        videos.extend(batch)
+                        db.video_generation_jobs.update_one(
+                            {"task_id": task_id},
+                            {"$set": {"videos": videos, "updated_at": datetime.utcnow()}},
+                        )
+
+                        # Wait for this batch to complete before submitting next
+                        if batch_start + GOOGLE_BATCH_SIZE < len(scene_entries):
+                            pending_ids = [e["external_id"] for e in batch if e.get("external_id")]
+                            for _ in range(60):  # max ~10 min wait per batch
+                                await asyncio.sleep(GOOGLE_POLL_INTERVAL)
+                                all_done = True
+                                for ext_id in pending_ids:
+                                    try:
+                                        GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+                                        api_base = "https://generativelanguage.googleapis.com/v1beta"
+                                        poll_resp = await http.get(
+                                            f"{api_base}/{ext_id}",
+                                            headers={"x-goog-api-key": GOOGLE_API_KEY},
+                                        )
+                                        if poll_resp.status_code == 200:
+                                            op = poll_resp.json()
+                                            if not op.get("done", False):
+                                                all_done = False
+                                                break
+                                    except Exception:
+                                        all_done = False
+                                        break
+                                if all_done:
+                                    break
+                else:
+                    # OpenAI / Replicate: submit all with small delays
+                    for entry in scene_entries:
+                        try:
+                            if is_openai_direct:
+                                external_id = await _submit_openai_sora(entry["prompt"], model_cfg, entry["duration_hint"], output_format)
+                            else:
+                                slug = getattr(model_cfg, "model_string", model) if model_cfg else model
+                                external_id = await _submit_replicate(http, entry["prompt"], slug, resolution)
+                            entry["external_id"] = external_id
+                        except Exception as submit_err:
+                            entry["status"] = "failed"
+                            entry["error"] = str(submit_err)
+                        if is_openai_direct:
+                            await asyncio.sleep(2)
+                    videos.extend(scene_entries)
+
+                global_idx += len(scene_entries)
+
+        # All per-scene jobs submitted — mark as processing so the status endpoint will poll
+        db.video_generation_jobs.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                "status": "processing",
+                "videos": videos,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        db.video_generation_jobs.update_one(
+            {"task_id": task_id},
+            {"$set": {"status": "failed", "error": str(e), "updated_at": datetime.utcnow()}},
+        )
+
+
+async def _submit_openai_sora(prompt: str, model_cfg, duration_hint: str, output_format: str | None = None) -> str:
+    """Submit a video generation request to OpenAI Sora. Returns the video ID."""
+    import asyncio
+    from openai import OpenAI
+
+    openai_client = OpenAI()
+    model_string = getattr(model_cfg, "model_string", "sora-2")
+
+    # Map duration_hint to allowed Sora seconds ("4", "8", "12")
+    # Scene <=4s → "4", scene >4s and <=8s → "8", scene >8s → "12"
+    dur_num = int(''.join(filter(str.isdigit, duration_hint)) or '4')
+    if dur_num <= 4:
+        sora_seconds = "4"
+    elif dur_num <= 8:
+        sora_seconds = "8"
+    else:
+        sora_seconds = "12"
+
+    # Map output_format to Sora size
+    FORMAT_TO_SIZE = {
+        "reel_9_16": "720x1280",
+        "story_9_16": "720x1280",
+        "post_1_1": "1024x1024",
+        "landscape_16_9": "1280x720",
+    }
+    size = FORMAT_TO_SIZE.get(output_format, "1280x720")
+
+    # OpenAI SDK is sync — run in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    video = await loop.run_in_executor(
+        None,
+        lambda: openai_client.videos.create(
+            model=model_string,
+            prompt=prompt,
+            size=size,
+            seconds=sora_seconds,
+        ),
+    )
+
+    video_id = video.id
+    if not video_id:
+        raise Exception(f"No video ID returned from OpenAI Sora: {video}")
+    return video_id
+
+
+async def _submit_google_veo(http, prompt: str, model_cfg, resolution: str | None, output_format: str | None = None) -> str:
+    """Submit a video generation request to Google Veo. Returns the operation name."""
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    if not GOOGLE_API_KEY:
+        raise Exception("GOOGLE_API_KEY not configured")
+
+    model_string = getattr(model_cfg, "model_string", "veo-3.1-generate-preview")
+    api_base = "https://generativelanguage.googleapis.com/v1beta"
+
+    # Map output_format to aspect ratio
+    FORMAT_TO_ASPECT = {
+        "reel_9_16": "9:16",
+        "story_9_16": "9:16",
+        "post_1_1": "1:1",
+        "landscape_16_9": "16:9",
+    }
+
+    params: dict = {"personGeneration": "allow_all"}
+    if resolution:
+        params["resolution"] = resolution
+    if output_format and output_format in FORMAT_TO_ASPECT:
+        params["aspectRatio"] = FORMAT_TO_ASPECT[output_format]
+
+    create_resp = await http.post(
+        f"{api_base}/models/{model_string}:predictLongRunning",
+        headers={
+            "x-goog-api-key": GOOGLE_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "instances": [{"prompt": prompt}],
+            "parameters": params,
+        },
+    )
+    if create_resp.status_code not in (200, 201):
+        raise Exception(f"Google Veo API error: {create_resp.status_code} {create_resp.text}")
+
+    operation = create_resp.json()
+    operation_name = operation.get("name")
+    if not operation_name:
+        raise Exception(f"No operation name returned from Google Veo: {operation}")
+    return operation_name
+
+
+async def _submit_replicate(http, prompt: str, model_slug: str, resolution: str | None) -> str:
+    """Submit a video generation request to Replicate. Returns the prediction poll URL."""
+    REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+    if not REPLICATE_API_TOKEN:
+        raise Exception("REPLICATE_API_TOKEN not configured")
+
+    input_data = {"prompt": prompt}
+    if resolution:
+        input_data["resolution"] = resolution
+
+    create_resp = await http.post(
+        f"https://api.replicate.com/v1/models/{model_slug}/predictions",
+        headers={
+            "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"input": input_data},
+    )
+    if create_resp.status_code != 201:
+        raise Exception(f"Replicate API error: {create_resp.status_code} {create_resp.text}")
+
+    prediction = create_resp.json()
+    prediction_url = prediction.get("urls", {}).get("get")
+    if not prediction_url:
+        raise Exception("No prediction URL returned from Replicate")
+    return prediction_url
+
+
+async def _download_and_upload_openai_video(openai_client, video_id: str, workflow_id: str, task_id: str, index: int) -> str:
+    """Download video from OpenAI Sora and upload to GCS. Returns signed GCS URL."""
+    import asyncio
+    import tempfile
+
+    loop = asyncio.get_event_loop()
+
+    # Download from OpenAI
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    await loop.run_in_executor(
+        None,
+        lambda: openai_client.videos.download_content(video_id).stream_to_file(tmp_path),
+    )
+
+    with open(tmp_path, "rb") as f:
+        video_bytes = f.read()
+    os.unlink(tmp_path)
+
+    # Upload to GCS
+    from google.cloud import storage as gcs_storage
+    from google.oauth2 import service_account
+
+    GCS_BUCKET = os.getenv("GCS_BUCKET", "video-marketing-simulation")
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json:
+        raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+
+    credentials_dict = json.loads(service_account_json)
+    credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+    storage_client = gcs_storage.Client(credentials=credentials, project=credentials.project_id)
+    bucket = storage_client.bucket(GCS_BUCKET)
+
+    blob_path = f"videos/{workflow_id}/{task_id}-scene{index}.mp4"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(video_bytes, content_type="video/mp4")
+
+    signed_url = blob.generate_signed_url(
+        version="v2",
+        expiration=timedelta(days=14),
+        method="GET",
+        credentials=credentials,
+    )
+    return signed_url
+
+
+def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_url: str, model: str, task_id: str = ""):
+    """Write a single completed scene video as a variation to the video_generation node immediately."""
+    if not video_url:
+        return
+
+    variation = {
+        "id": f"{task_id}-scene{scene_number}-{model}",
+        "title": f"Scene {scene_number} — {model}",
+        "preview": video_url,
+        "type": "scene",
+        "task_id": task_id,
+        "scene_number": scene_number,
+        "model": model,
+    }
+
+    video_node = db.content_workflow_nodes.find_one({
+        "workflow_id": workflow_id,
+        "stage_key": "video_generation",
+    })
+
+    if video_node:
+        existing_variations = video_node.get("output_data", {}).get("variations", [])
+        # Avoid duplicates
+        if not any(v.get("id") == variation["id"] for v in existing_variations):
+            existing_variations.append(variation)
+            db.content_workflow_nodes.update_one(
+                {"_id": video_node["_id"]},
+                {"$set": {
+                    "output_data.variations": existing_variations,
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+    else:
+        db.content_workflow_nodes.insert_one({
+            "workflow_id": workflow_id,
+            "stage_key": "video_generation",
+            "status": "in_progress",
+            "output_data": {
+                "variations": [variation],
+            },
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        })
+
+
+async def _upload_video_to_gcs(http, video_uri: str, workflow_id: str, task_id: str, index: int, headers: dict) -> str:
+    """Download video from temporary URL and upload to GCS. Returns signed URL."""
+    vid_resp = await http.get(video_uri, headers=headers, follow_redirects=True, timeout=120)
+    if vid_resp.status_code != 200:
+        raise Exception(f"Failed to download video: {vid_resp.status_code}")
+    video_bytes = vid_resp.content
+
+    from google.cloud import storage as gcs_storage
+    from google.oauth2 import service_account
+
+    GCS_BUCKET = os.getenv("GCS_BUCKET", "video-marketing-simulation")
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json:
+        raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+
+    credentials_dict = json.loads(service_account_json)
+    credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+    storage_client = gcs_storage.Client(credentials=credentials, project=credentials.project_id)
+    bucket = storage_client.bucket(GCS_BUCKET)
+
+    blob_path = f"videos/{workflow_id}/{task_id}-{index}.mp4"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(video_bytes, content_type="video/mp4")
+
+    signed_url = blob.generate_signed_url(
+        version="v2",
+        expiration=timedelta(days=14),
+        method="GET",
+        credentials=credentials,
+    )
+    return signed_url
+
+
+async def _stitch_scene_videos(workflow_id: str, task_id: str, set_idx: int, videos: list, model: str):
+    """Download scene clips for a set, concatenate with ffmpeg, upload stitched video to GCS."""
+    import tempfile
+    import subprocess
+    import httpx
+
+    try:
+        # Filter videos for this set, sorted by scene_index
+        set_videos = sorted(
+            [v for v in videos if v.get("set_index") == set_idx and v.get("status") == "completed"],
+            key=lambda v: v.get("scene_index", 0),
+        )
+
+        if not set_videos:
+            db.video_generation_jobs.update_one(
+                {"task_id": task_id},
+                {"$set": {f"sets.{set_idx}.status": "failed", f"sets.{set_idx}.error": "No completed scenes", "updated_at": datetime.utcnow()}},
+            )
+            return
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Download each scene clip
+            clip_paths = []
+            async with httpx.AsyncClient(timeout=120) as http:
+                for v in set_videos:
+                    video_url = v["video_url"]
+                    scene_idx = v["scene_index"]
+                    clip_path = os.path.join(tmpdir, f"scene_{scene_idx:03d}.mp4")
+
+                    if video_url.startswith("openai://videos/"):
+                        # Download from OpenAI Sora API
+                        import asyncio
+                        from openai import OpenAI as _OpenAI
+                        openai_client = _OpenAI()
+                        oai_video_id = video_url.replace("openai://videos/", "").replace("/content", "")
+                        loop = asyncio.get_event_loop()
+                        content_resp = await loop.run_in_executor(
+                            None,
+                            lambda vid=oai_video_id: openai_client.videos.download_content(vid),
+                        )
+                        content_resp.stream_to_file(clip_path)
+                    else:
+                        resp = await http.get(video_url, follow_redirects=True, timeout=120)
+                        if resp.status_code != 200:
+                            raise Exception(f"Failed to download scene {scene_idx}: HTTP {resp.status_code}")
+                        with open(clip_path, "wb") as f:
+                            f.write(resp.content)
+
+                    clip_paths.append(clip_path)
+
+            # Write ffmpeg concat list
+            list_path = os.path.join(tmpdir, "concat_list.txt")
+            with open(list_path, "w") as f:
+                for cp in clip_paths:
+                    f.write(f"file '{cp}'\n")
+
+            # Run ffmpeg to concatenate
+            output_path = os.path.join(tmpdir, "stitched_output.mp4")
+            result = subprocess.run(
+                ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path,
+                 "-c:v", "libx264", "-c:a", "aac", "-y", output_path],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                raise Exception(f"ffmpeg failed: {result.stderr}")
+
+            # Upload stitched video to GCS
+            from google.cloud import storage as gcs_storage
+            from google.oauth2 import service_account
+
+            GCS_BUCKET = os.getenv("GCS_BUCKET", "video-marketing-simulation")
+            service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+            if not service_account_json:
+                raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+
+            credentials_dict = json.loads(service_account_json)
+            credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+            storage_client = gcs_storage.Client(credentials=credentials, project=credentials.project_id)
+            bucket = storage_client.bucket(GCS_BUCKET)
+
+            blob_path = f"videos/{workflow_id}/{task_id}-set{set_idx}-stitched.mp4"
+            blob = bucket.blob(blob_path)
+
+            with open(output_path, "rb") as f:
+                blob.upload_from_file(f, content_type="video/mp4")
+
+            signed_url = blob.generate_signed_url(
+                version="v2",
+                expiration=timedelta(days=14),
+                method="GET",
+                credentials=credentials,
+            )
+
+        # Update job: mark this set as done with stitched URL
+        db.video_generation_jobs.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                f"sets.{set_idx}.status": "done",
+                f"sets.{set_idx}.stitched_url": signed_url,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+        # Check if all sets are done — if so, mark job completed and write variations
+        job = db.video_generation_jobs.find_one({"task_id": task_id})
+        if job:
+            sets = job.get("sets", {})
+            all_sets_done = all(s.get("status") in ("done", "failed") for s in sets.values())
+            if all_sets_done:
+                db.video_generation_jobs.update_one(
+                    {"task_id": task_id},
+                    {"$set": {"status": "completed", "updated_at": datetime.utcnow()}},
+                )
+                _write_video_variations_to_node(workflow_id, task_id, job.get("videos", []), sets, model)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        db.video_generation_jobs.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                f"sets.{set_idx}.status": "failed",
+                f"sets.{set_idx}.error": str(e),
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+
+def _write_video_variations_to_node(workflow_id: str, task_id: str, videos: list, sets: dict, model: str):
+    """Write one variation per completed stitched set to the video_generation node's output_data."""
+    variations = []
+    for set_idx_str, set_info in sorted(sets.items(), key=lambda x: int(x[0])):
+        stitched_url = set_info.get("stitched_url")
+        if stitched_url:
+            set_idx = int(set_idx_str)
+            variations.append({
+                "id": f"{task_id}-set{set_idx}",
+                "title": f"Video {set_idx + 1} — {model}",
+                "preview": stitched_url,
+                "type": "video",
+                "status": "draft",
+            })
+
+    video_node = db.content_workflow_nodes.find_one({
+        "workflow_id": workflow_id,
+        "stage_key": "video_generation",
+    })
+    if video_node:
+        existing_videos = video_node.get("output_data", {}).get("videos", [])
+        existing_videos.extend(videos)
+        existing_variations = video_node.get("output_data", {}).get("variations", [])
+        existing_variations.extend(variations)
+        db.content_workflow_nodes.update_one(
+            {"_id": video_node["_id"]},
+            {"$set": {
+                "output_data.videos": existing_videos,
+                "output_data.variations": existing_variations,
+                "status": "completed",
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+    else:
+        # Create the node if it doesn't exist
+        db.content_workflow_nodes.insert_one({
+            "workflow_id": workflow_id,
+            "stage_key": "video_generation",
+            "status": "completed",
+            "output_data": {
+                "videos": videos,
+                "variations": variations,
+            },
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        })
 
 
 # --- Helpers ---

@@ -1,7 +1,7 @@
 """
 Content Generation Pipeline Definition
 
-14-stage pipeline with stage metadata, types, transitions, and feedback loops.
+15-stage pipeline with stage metadata, types, transitions, and feedback loops.
 This is the single source of truth for the pipeline structure.
 """
 
@@ -51,11 +51,25 @@ PIPELINE_STAGES: List[StageDefinition] = [
         agent_name="concepts_agent",
     ),
     StageDefinition(
-        key="content_generation",
-        label="Content Generation",
+        key="image_generation",
+        label="Image Generation",
         stage_type="agent",
-        description="Produce videos, images, and voiceovers using AI.",
-        agent_name="content_gen_agent",
+        description="Generate concept art and reference images for each concept before storyboarding.",
+        agent_name="image_gen_agent",
+    ),
+    StageDefinition(
+        key="storyboard",
+        label="Storyboard",
+        stage_type="agent",
+        description="Generate detailed storylines with scenes, characters, and visual assets for each concept.",
+        agent_name="storyboard_agent",
+    ),
+    StageDefinition(
+        key="video_generation",
+        label="Video Generation",
+        stage_type="agent",
+        description="Produce videos and voiceovers using AI.",
+        agent_name="video_gen_agent",
     ),
     StageDefinition(
         key="simulation_testing",
