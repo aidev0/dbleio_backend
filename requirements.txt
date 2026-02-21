@@ -41,3 +41,6 @@ httpx
 # Authentication
 workos
 PyJWT[crypto]
+
+# Web scraping
+apify-client

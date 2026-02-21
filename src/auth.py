@@ -41,6 +41,7 @@ EXCLUDED_PATHS = [
     "/api/users/auth/refresh",  # Token refresh endpoint (needs to work with expired token)
     "/api/feature-requests",  # Public form submissions from landing page
     "/api/contact",  # Public contact form submissions
+    "/api/instagram/proxy",  # Image/video proxy for CDN content
 ]
 
 # Cache for JWKS keys
