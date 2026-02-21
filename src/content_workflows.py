@@ -66,6 +66,7 @@ class GenerateStoryboardRequest(BaseModel):
 
 class GenerateStoryboardImageRequest(BaseModel):
     concept_index: int
+    variation_index: int = 0
     target_type: str  # "character" | "scene"
     target_id: str
     image_model: Optional[str] = None
@@ -78,6 +79,7 @@ class GenerateVideoRequest(BaseModel):
     output_format: Optional[str] = None  # reel_9_16, story_9_16, etc.
     resolution: Optional[str] = None  # 720p, 1080p, 4k
     temperature: Optional[float] = None
+    custom_prompt: Optional[str] = None  # user-provided prompt template
 
 
 # --- Helpers ---
@@ -101,18 +103,57 @@ def _workflow_helper(doc) -> dict:
     }
 
 
+def _refresh_media_urls(output_data: dict) -> dict:
+    """Re-sign GCS URLs in output_data so media never expires for the client."""
+    from src.videos import get_fresh_signed_url
+
+    # Re-sign video variations
+    for var in output_data.get("variations", []):
+        gs_uri = var.get("gs_uri")
+        if gs_uri:
+            fresh = get_fresh_signed_url(gs_uri)
+            if fresh:
+                var["preview"] = fresh
+
+    # Re-sign storyboard character & scene images
+    for sb in output_data.get("storyboards", []):
+        for char in sb.get("characters", []):
+            gs_uri = char.get("gs_uri")
+            if gs_uri:
+                fresh = get_fresh_signed_url(gs_uri)
+                if fresh:
+                    char["image_url"] = fresh
+        for scene in sb.get("scenes", []):
+            gs_uri = scene.get("gs_uri")
+            if gs_uri:
+                fresh = get_fresh_signed_url(gs_uri)
+                if fresh:
+                    scene["image_url"] = fresh
+
+    return output_data
+
+
 def _node_helper(doc) -> dict:
     if not doc:
         return {}
+
+    stage_key = doc.get("stage_key")
+    output_data = doc.get("output_data", {})
+
+    # Re-sign GCS URLs for stages that contain media
+    if stage_key in ("video_generation", "storyboard") and output_data:
+        import copy
+        output_data = _refresh_media_urls(copy.deepcopy(output_data))
+
     return {
         "_id": str(doc["_id"]),
         "workflow_id": doc.get("workflow_id"),
-        "stage_key": doc.get("stage_key"),
+        "stage_key": stage_key,
         "stage_index": doc.get("stage_index"),
         "stage_type": doc.get("stage_type"),
         "status": doc.get("status"),
         "input_data": doc.get("input_data", {}),
-        "output_data": doc.get("output_data", {}),
+        "output_data": output_data,
         "error": doc.get("error"),
         "started_at": doc.get("started_at"),
         "completed_at": doc.get("completed_at"),
@@ -799,8 +840,21 @@ Return ONLY valid JSON in this exact format:
             scene["image_model"] = image_model
 
         # Build the storyboard entry
+        # Determine variation_index for this concept
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        existing_output = storyboard_node.get("output_data", {}) if storyboard_node else {}
+        existing_storyboards = existing_output.get("storyboards", [])
+
+        # Count existing variations for this concept to assign next variation_index
+        existing_for_concept = [sb for sb in existing_storyboards if sb.get("concept_index") == body.concept_index]
+        variation_index = len(existing_for_concept)
+
         storyboard_entry = {
             "concept_index": body.concept_index,
+            "variation_index": variation_index,
             "concept_title": concept_title,
             "storyline": storyboard_data.get("storyline", ""),
             "total_cuts": storyboard_data.get("total_cuts", len(storyboard_data.get("scenes", []))),
@@ -809,23 +863,8 @@ Return ONLY valid JSON in this exact format:
             "status": "storyline_ready",
         }
 
-        # Load existing storyboard node output_data and update
-        storyboard_node = db.content_workflow_nodes.find_one({
-            "workflow_id": workflow_id,
-            "stage_key": "storyboard",
-        })
-        existing_output = storyboard_node.get("output_data", {}) if storyboard_node else {}
-        existing_storyboards = existing_output.get("storyboards", [])
-
-        # Replace or add storyboard for this concept_index
-        found = False
-        for i, sb in enumerate(existing_storyboards):
-            if sb.get("concept_index") == body.concept_index:
-                existing_storyboards[i] = storyboard_entry
-                found = True
-                break
-        if not found:
-            existing_storyboards.append(storyboard_entry)
+        # Always append as a new variation
+        existing_storyboards.append(storyboard_entry)
 
         output_data = {
             "storyboards": existing_storyboards,
@@ -948,12 +987,13 @@ async def generate_storyboard_image(
         output_data = storyboard_node["output_data"]
         storyboards = output_data.get("storyboards", [])
 
-        # Find the storyboard for this concept_index
+        # Find the storyboard for this concept_index + variation_index
         storyboard = None
-        for sb in storyboards:
-            if sb.get("concept_index") == body.concept_index:
-                storyboard = sb
-                break
+        concept_matches = [sb for sb in storyboards if sb.get("concept_index") == body.concept_index]
+        if body.variation_index < len(concept_matches):
+            storyboard = concept_matches[body.variation_index]
+        elif concept_matches:
+            storyboard = concept_matches[0]
         if not storyboard:
             raise HTTPException(status_code=400, detail=f"No storyboard for concept_index {body.concept_index}")
 
@@ -1027,6 +1067,7 @@ async def generate_storyboard_image(
             task_id,
             workflow_id,
             body.concept_index,
+            body.variation_index,
             body.target_type,
             body.target_id,
             image_prompt,
@@ -1066,6 +1107,7 @@ async def _generate_storyboard_image_background(
     task_id: str,
     workflow_id: str,
     concept_index: int,
+    variation_index: int,
     target_type: str,
     target_id: str,
     image_prompt: str,
@@ -1170,8 +1212,8 @@ async def _generate_storyboard_image_background(
 
         gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
         signed_url = blob.generate_signed_url(
-            version="v2",
-            expiration=timedelta(days=14),
+            version="v4",
+            expiration=timedelta(days=7),
             method="GET",
             credentials=credentials,
         )
@@ -1186,24 +1228,24 @@ async def _generate_storyboard_image_background(
         if storyboard_node:
             output = storyboard_node.get("output_data", {})
             storyboards = output.get("storyboards", [])
-            for sb in storyboards:
-                if sb.get("concept_index") == concept_index:
-                    collection = sb.get("characters" if target_type == "character" else "scenes", [])
-                    for item in collection:
-                        if item.get("id") == target_id:
-                            item["image_url"] = signed_url
-                            item["gs_uri"] = gs_uri
-                            item["image_model"] = image_model
-                            break
+            concept_matches = [sb for sb in storyboards if sb.get("concept_index") == concept_index]
+            sb = concept_matches[variation_index] if variation_index < len(concept_matches) else (concept_matches[0] if concept_matches else None)
+            if sb:
+                collection = sb.get("characters" if target_type == "character" else "scenes", [])
+                for item in collection:
+                    if item.get("id") == target_id:
+                        item["image_url"] = signed_url
+                        item["gs_uri"] = gs_uri
+                        item["image_model"] = image_model
+                        break
 
-                    # Check if all images are done for this storyboard
-                    all_chars_done = all(c.get("image_url") for c in sb.get("characters", []))
-                    all_scenes_done = all(s.get("image_url") for s in sb.get("scenes", []))
-                    if all_chars_done and all_scenes_done:
-                        sb["status"] = "complete"
-                    elif any(c.get("image_url") for c in sb.get("characters", [])) or any(s.get("image_url") for s in sb.get("scenes", [])):
-                        sb["status"] = "images_generating"
-                    break
+                # Check if all images are done for this storyboard
+                all_chars_done = all(c.get("image_url") for c in sb.get("characters", []))
+                all_scenes_done = all(s.get("image_url") for s in sb.get("scenes", []))
+                if all_chars_done and all_scenes_done:
+                    sb["status"] = "complete"
+                elif any(c.get("image_url") for c in sb.get("characters", [])) or any(s.get("image_url") for s in sb.get("scenes", [])):
+                    sb["status"] = "images_generating"
 
             # Save updated node
             db.content_workflow_nodes.update_one(
@@ -1313,6 +1355,7 @@ async def generate_video(
             output_format=body.output_format,
             resolution=body.resolution,
             temperature=body.temperature,
+            custom_prompt=body.custom_prompt,
         )
 
         return {"task_id": task_id, "status": "pending", "model": body.model, "count": body.count}
@@ -1351,13 +1394,15 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
                             from openai import OpenAI as _OpenAI
                             openai_client = _OpenAI()
                             video_id = v.get("external_id")
-                            gcs_url = await _download_and_upload_openai_video(
+                            gs_uri, gcs_url = await _download_and_upload_openai_video(
                                 openai_client, video_id, workflow_id, task_id, v["index"],
                             )
                             v["video_url"] = gcs_url
+                            v["gs_uri"] = gs_uri
                             updated = True
                             _write_scene_variation_to_node(
                                 workflow_id, v["scene_number"], gcs_url, job.get("model", "sora-2"), task_id,
+                                gs_uri=gs_uri,
                             )
                         except Exception as dl_err:
                             print(f"Failed to download/upload existing OpenAI video {v.get('external_id')}: {dl_err}")
@@ -1386,10 +1431,11 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
                             if ext_status == "completed":
                                 # Download from OpenAI, upload to GCS, write variation immediately
                                 try:
-                                    gcs_url = await _download_and_upload_openai_video(
+                                    gs_uri, gcs_url = await _download_and_upload_openai_video(
                                         openai_client, video_id, workflow_id, task_id, v["index"],
                                     )
                                     v["video_url"] = gcs_url
+                                    v["gs_uri"] = gs_uri
                                 except Exception as dl_err:
                                     print(f"Failed to download/upload OpenAI video {video_id}: {dl_err}")
                                     v["video_url"] = f"openai://videos/{video_id}/content"
@@ -1398,6 +1444,7 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
                                 # Write individual scene variation to node immediately
                                 _write_scene_variation_to_node(
                                     workflow_id, v["scene_number"], v.get("video_url"), job.get("model", "sora-2"), task_id,
+                                    gs_uri=v.get("gs_uri"),
                                 )
                             elif ext_status == "failed":
                                 v["status"] = "failed"
@@ -1425,13 +1472,22 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
                                 if samples:
                                     video_uri = samples[0].get("video", {}).get("uri")
                                 if video_uri:
-                                    # Use Google's temporary URL directly (valid ~2 days)
-                                    # Append API key for authenticated download
-                                    v["video_url"] = f"{video_uri}&key={GOOGLE_API_KEY}"
+                                    # Upload to GCS for permanent storage
+                                    download_url = f"{video_uri}&key={GOOGLE_API_KEY}"
+                                    try:
+                                        gs_uri, gcs_url = await _upload_video_to_gcs(
+                                            http, download_url, workflow_id, task_id, v["index"],
+                                        )
+                                        v["video_url"] = gcs_url
+                                        v["gs_uri"] = gs_uri
+                                    except Exception as gcs_err:
+                                        print(f"Failed to upload Veo video to GCS: {gcs_err}")
+                                        v["video_url"] = download_url
                                     v["status"] = "completed"
                                     updated = True
                                     _write_scene_variation_to_node(
                                         workflow_id, v["scene_number"], v["video_url"], job.get("model", ""), task_id,
+                                        gs_uri=v.get("gs_uri"),
                                     )
                                 else:
                                     v["status"] = "failed"
@@ -1457,14 +1513,27 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
 
                             if ext_status == "succeeded":
                                 output = poll_data.get("output")
+                                raw_url = None
                                 if isinstance(output, list) and len(output) > 0:
-                                    v["video_url"] = output[0]
+                                    raw_url = output[0]
                                 elif isinstance(output, str):
-                                    v["video_url"] = output
+                                    raw_url = output
+                                # Upload to GCS for permanent storage
+                                if raw_url:
+                                    try:
+                                        gs_uri, gcs_url = await _upload_video_to_gcs(
+                                            http, raw_url, workflow_id, task_id, v["index"],
+                                        )
+                                        v["video_url"] = gcs_url
+                                        v["gs_uri"] = gs_uri
+                                    except Exception as gcs_err:
+                                        print(f"Failed to upload Replicate video to GCS: {gcs_err}")
+                                        v["video_url"] = raw_url
                                 v["status"] = "completed"
                                 updated = True
                                 _write_scene_variation_to_node(
                                     workflow_id, v["scene_number"], v.get("video_url"), job.get("model", ""), task_id,
+                                    gs_uri=v.get("gs_uri"),
                                 )
                             elif ext_status == "failed":
                                 v["status"] = "failed"
@@ -1631,6 +1700,7 @@ async def _run_video_generation(
     output_format: str | None,
     resolution: str | None,
     temperature: float | None,
+    custom_prompt: str | None = None,
 ):
     """Background task: submit video generation jobs to external APIs (non-blocking)."""
     import httpx
@@ -1676,14 +1746,24 @@ async def _run_video_generation(
                     char_desc = ", ".join([f"{c['name']}: {c.get('description', '')}" for c in scene_chars])
                     duration_hint = scene.get("duration_hint", "5s")
 
-                    scene_prompt = f"Storyline context: {storyline}\n\n"
-                    scene_prompt += f"Generate ONLY this specific scene as a single video clip:\n"
-                    scene_prompt += f"Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
-                    if char_desc:
-                        scene_prompt += f" Characters: {char_desc}."
-                    if scene.get("shot_type"):
-                        scene_prompt += f" Shot type: {scene['shot_type']}."
-                    scene_prompt += f"\n\nIMPORTANT: This video clip MUST be exactly {duration_hint} long."
+                    if custom_prompt:
+                        # Interpolate user-provided template with scene variables
+                        scene_prompt = custom_prompt.replace("{storyline}", storyline)
+                        scene_prompt = scene_prompt.replace("{scene_number}", str(scene.get("scene_number", j + 1)))
+                        scene_prompt = scene_prompt.replace("{title}", scene.get("title", ""))
+                        scene_prompt = scene_prompt.replace("{description}", scene.get("description", ""))
+                        scene_prompt = scene_prompt.replace("{characters}", char_desc)
+                        scene_prompt = scene_prompt.replace("{shot_type}", scene.get("shot_type", ""))
+                        scene_prompt = scene_prompt.replace("{duration_hint}", duration_hint)
+                    else:
+                        scene_prompt = f"Storyline context: {storyline}\n\n"
+                        scene_prompt += f"Generate ONLY this specific scene as a single video clip:\n"
+                        scene_prompt += f"Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
+                        if char_desc:
+                            scene_prompt += f" Characters: {char_desc}."
+                        if scene.get("shot_type"):
+                            scene_prompt += f" Shot type: {scene['shot_type']}."
+                        scene_prompt += f"\n\nIMPORTANT: This video clip MUST be exactly {duration_hint} long."
 
                     scene_entries.append({
                         "index": global_idx + j,
@@ -1900,8 +1980,8 @@ async def _submit_replicate(http, prompt: str, model_slug: str, resolution: str 
     return prediction_url
 
 
-async def _download_and_upload_openai_video(openai_client, video_id: str, workflow_id: str, task_id: str, index: int) -> str:
-    """Download video from OpenAI Sora and upload to GCS. Returns signed GCS URL."""
+async def _download_and_upload_openai_video(openai_client, video_id: str, workflow_id: str, task_id: str, index: int) -> tuple:
+    """Download video from OpenAI Sora and upload to GCS. Returns (gs_uri, signed_url)."""
     import asyncio
     import tempfile
 
@@ -1938,16 +2018,17 @@ async def _download_and_upload_openai_video(openai_client, video_id: str, workfl
     blob = bucket.blob(blob_path)
     blob.upload_from_string(video_bytes, content_type="video/mp4")
 
+    gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
     signed_url = blob.generate_signed_url(
-        version="v2",
-        expiration=timedelta(days=14),
+        version="v4",
+        expiration=timedelta(days=7),
         method="GET",
         credentials=credentials,
     )
-    return signed_url
+    return (gs_uri, signed_url)
 
 
-def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_url: str, model: str, task_id: str = ""):
+def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_url: str, model: str, task_id: str = "", gs_uri: str = None):
     """Write a single completed scene video as a variation to the video_generation node immediately."""
     if not video_url:
         return
@@ -1961,6 +2042,8 @@ def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_ur
         "scene_number": scene_number,
         "model": model,
     }
+    if gs_uri:
+        variation["gs_uri"] = gs_uri
 
     video_node = db.content_workflow_nodes.find_one({
         "workflow_id": workflow_id,
@@ -1992,9 +2075,9 @@ def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_ur
         })
 
 
-async def _upload_video_to_gcs(http, video_uri: str, workflow_id: str, task_id: str, index: int, headers: dict) -> str:
-    """Download video from temporary URL and upload to GCS. Returns signed URL."""
-    vid_resp = await http.get(video_uri, headers=headers, follow_redirects=True, timeout=120)
+async def _upload_video_to_gcs(http, video_uri: str, workflow_id: str, task_id: str, index: int, headers: dict = None) -> tuple:
+    """Download video from temporary URL and upload to GCS. Returns (gs_uri, signed_url)."""
+    vid_resp = await http.get(video_uri, headers=headers or {}, follow_redirects=True, timeout=120)
     if vid_resp.status_code != 200:
         raise Exception(f"Failed to download video: {vid_resp.status_code}")
     video_bytes = vid_resp.content
@@ -2016,13 +2099,14 @@ async def _upload_video_to_gcs(http, video_uri: str, workflow_id: str, task_id: 
     blob = bucket.blob(blob_path)
     blob.upload_from_string(video_bytes, content_type="video/mp4")
 
+    gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
     signed_url = blob.generate_signed_url(
-        version="v2",
-        expiration=timedelta(days=14),
+        version="v4",
+        expiration=timedelta(days=7),
         method="GET",
         credentials=credentials,
     )
-    return signed_url
+    return (gs_uri, signed_url)
 
 
 async def _stitch_scene_videos(workflow_id: str, task_id: str, set_idx: int, videos: list, model: str):
@@ -2112,18 +2196,21 @@ async def _stitch_scene_videos(workflow_id: str, task_id: str, set_idx: int, vid
                 blob.upload_from_file(f, content_type="video/mp4")
 
             signed_url = blob.generate_signed_url(
-                version="v2",
-                expiration=timedelta(days=14),
+                version="v4",
+                expiration=timedelta(days=7),
                 method="GET",
                 credentials=credentials,
             )
 
-        # Update job: mark this set as done with stitched URL
+        gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
+
+        # Update job: mark this set as done with stitched URL and gs_uri
         db.video_generation_jobs.update_one(
             {"task_id": task_id},
             {"$set": {
                 f"sets.{set_idx}.status": "done",
                 f"sets.{set_idx}.stitched_url": signed_url,
+                f"sets.{set_idx}.gs_uri": gs_uri,
                 "updated_at": datetime.utcnow(),
             }},
         )
@@ -2160,13 +2247,17 @@ def _write_video_variations_to_node(workflow_id: str, task_id: str, videos: list
         stitched_url = set_info.get("stitched_url")
         if stitched_url:
             set_idx = int(set_idx_str)
-            variations.append({
+            var = {
                 "id": f"{task_id}-set{set_idx}",
                 "title": f"Video {set_idx + 1} — {model}",
                 "preview": stitched_url,
                 "type": "video",
                 "status": "draft",
-            })
+            }
+            gs_uri = set_info.get("gs_uri")
+            if gs_uri:
+                var["gs_uri"] = gs_uri
+            variations.append(var)
 
     video_node = db.content_workflow_nodes.find_one({
         "workflow_id": workflow_id,

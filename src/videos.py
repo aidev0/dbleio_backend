@@ -130,7 +130,7 @@ def get_fresh_signed_url(gs_uri: str) -> Optional[str]:
         creds = get_google_credentials()
         signed_url = blob.generate_signed_url(
             version="v2",
-            expiration=timedelta(days=14),
+            expiration=timedelta(days=7),
             method="GET",
             credentials=creds
         )
@@ -444,11 +444,10 @@ def upload_to_gcs(file: UploadFile, campaign_id: str) -> Dict[str, str]:
         gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
 
         # Generate a signed URL (valid for 7 days) for viewing
-        # This works with uniform bucket-level access
         creds = get_google_credentials()
         video_url = blob.generate_signed_url(
             version="v2",
-            expiration=timedelta(days=14),
+            expiration=timedelta(days=7),
             method="GET",
             credentials=creds
         )

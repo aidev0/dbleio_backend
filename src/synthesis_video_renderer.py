@@ -94,12 +94,12 @@ def upload_video_to_gcs(local_path: str, campaign_id: str, synthesis_video_id: s
         print(f"  Uploading to GCS: {blob_name}...")
         blob.upload_from_filename(local_path, content_type='video/mp4')
 
-        # Generate signed URL (valid for 14 days)
+        # Generate signed URL (valid for 7 days)
         credentials = get_google_credentials()
         from datetime import timedelta
         video_url = blob.generate_signed_url(
             version="v2",
-            expiration=timedelta(days=14),
+            expiration=timedelta(days=7),
             method="GET",
             credentials=credentials
         )
