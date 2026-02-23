@@ -402,7 +402,70 @@ async def submit_stage_input(workflow_id: str, stage_key: str, body: HumanInputR
         from src.content_generation.orchestrator import ContentOrchestrator
         orchestrator = ContentOrchestrator(workflow_id)
         result = await orchestrator.submit_human_input(stage_key, workos_user_id, body.input_data)
+        # When a stage is completed, make it the current stage
+        if stage_key in STAGE_ORDER:
+            idx = STAGE_ORDER.index(stage_key)
+            db.content_workflows.update_one(
+                {"_id": ObjectId(workflow_id)},
+                {"$set": {"current_stage": stage_key, "current_stage_index": idx}}
+            )
         return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+STAGE_ORDER = [
+    "strategy_assets", "scheduling", "research", "concepts",
+    "image_generation", "storyboard", "video_generation", "simulation_testing",
+    "brand_qa", "fdm_review", "publish", "metrics",
+    "analytics", "channel_learning", "ab_testing", "reinforcement_learning",
+]
+
+# Stages that are available (not "coming soon")
+AVAILABLE_STAGES = {
+    "strategy_assets", "scheduling", "concepts",
+    "image_generation", "storyboard", "video_generation",
+}
+
+
+def _recalculate_current_stage(workflow_id: str):
+    """Set current_stage to the first non-completed available stage, or the last completed one if all done."""
+    nodes = {n["stage_key"]: n["status"] for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
+    for i, key in enumerate(STAGE_ORDER):
+        if nodes.get(key) != "completed":
+            if key in AVAILABLE_STAGES:
+                db.content_workflows.update_one(
+                    {"_id": ObjectId(workflow_id)},
+                    {"$set": {"current_stage": key, "current_stage_index": i}}
+                )
+                return
+            # Skip unavailable stages, keep looking
+            continue
+    # All available stages completed — set to last stage
+    db.content_workflows.update_one(
+        {"_id": ObjectId(workflow_id)},
+        {"$set": {"current_stage": STAGE_ORDER[-1], "current_stage_index": len(STAGE_ORDER) - 1}}
+    )
+
+
+@router.post("/{workflow_id}/stages/{stage_key}/reset")
+async def reset_stage(workflow_id: str, stage_key: str, request: Request):
+    """Reset a completed stage back to pending."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        result = db.content_workflow_nodes.update_one(
+            {"workflow_id": workflow_id, "stage_key": stage_key},
+            {"$set": {"status": "pending"}, "$unset": {"output_data": ""}}
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Stage not found")
+        _recalculate_current_stage(workflow_id)
+        return {"status": "ok", "stage_key": stage_key}
     except HTTPException:
         raise
     except Exception as e:
