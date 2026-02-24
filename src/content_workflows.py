@@ -460,7 +460,7 @@ async def reset_stage(workflow_id: str, stage_key: str, request: Request):
 
         result = db.content_workflow_nodes.update_one(
             {"workflow_id": workflow_id, "stage_key": stage_key},
-            {"$set": {"status": "pending"}, "$unset": {"output_data": ""}}
+            {"$set": {"status": "pending"}}
         )
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Stage not found")
