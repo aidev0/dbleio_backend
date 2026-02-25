@@ -433,15 +433,15 @@ async def submit_stage_input(workflow_id: str, stage_key: str, body: HumanInputR
 
 
 STAGE_ORDER = [
-    "strategy_assets", "scheduling", "research", "concepts",
-    "image_generation", "storyboard", "video_generation", "simulation_testing",
-    "brand_qa", "fdm_review", "publish", "metrics",
-    "analytics", "channel_learning", "ab_testing", "reinforcement_learning",
+    "brand", "campaign_strategy", "research", "scheduling",
+    "concepts", "image_generation", "storyboard", "video_generation",
+    "simulation_testing", "predictive_modeling", "content_ranking",
+    "fdm_review", "brand_qa", "publish", "analytics",
 ]
 
 # Stages that are available (not "coming soon")
 AVAILABLE_STAGES = {
-    "strategy_assets", "scheduling", "concepts",
+    "brand", "campaign_strategy", "scheduling", "concepts",
     "image_generation", "storyboard", "video_generation",
     "simulation_testing",
 }

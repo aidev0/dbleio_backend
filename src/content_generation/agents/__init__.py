@@ -13,14 +13,12 @@ from src.content_generation.agents.concepts import ConceptsAgent
 from src.content_generation.agents.storyboard import StoryboardAgent
 from src.content_generation.agents.content_gen import ContentGenAgent
 from src.content_generation.agents.simulation import SimulationAgent
+from src.content_generation.agents.predictive_modeling import PredictiveModelingAgent
+from src.content_generation.agents.content_ranking import ContentRankingAgent
 from src.content_generation.agents.publish import PublishAgent
-from src.content_generation.agents.metrics import MetricsAgent
 from src.content_generation.agents.analytics import AnalyticsAgent
-from src.content_generation.agents.channel_learning import ChannelLearningAgent
-from src.content_generation.agents.ab_testing import ABTestingAgent
-from src.content_generation.agents.reinforcement import ReinforcementAgent
 
-# Registry: agent_name → class
+# Registry: agent_name -> class
 AGENT_REGISTRY = {
     "strategy_agent": StrategyAgent,
     "scheduling_agent": SchedulingAgent,
@@ -30,12 +28,10 @@ AGENT_REGISTRY = {
     "storyboard_agent": StoryboardAgent,
     "video_gen_agent": ContentGenAgent,
     "simulation_agent": SimulationAgent,
+    "predictive_modeling_agent": PredictiveModelingAgent,
+    "content_ranking_agent": ContentRankingAgent,
     "publish_agent": PublishAgent,
-    "metrics_agent": MetricsAgent,
     "analytics_agent": AnalyticsAgent,
-    "channel_learning_agent": ChannelLearningAgent,
-    "ab_testing_agent": ABTestingAgent,
-    "reinforcement_agent": ReinforcementAgent,
 }
 
 

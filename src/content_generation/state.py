@@ -54,7 +54,7 @@ class WorkflowState:
     @property
     def current_stage(self) -> str:
         doc = self._load()
-        return doc.get("current_stage", "strategy_assets") if doc else "strategy_assets"
+        return doc.get("current_stage", "brand") if doc else "brand"
 
     @property
     def status(self) -> str:

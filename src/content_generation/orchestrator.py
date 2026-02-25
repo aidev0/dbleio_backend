@@ -11,7 +11,7 @@ Responsibilities:
 - Manages the workflow state machine (transitions, approvals, rejections)
 - Invokes agents as tools for each pipeline stage
 - Persists all state (workflow_states, agent_states, user_sessions)
-- Handles feedback loops (QA reject → concepts, RL → research)
+- Handles feedback loops (QA reject -> concepts, analytics -> research)
 """
 
 from datetime import datetime
@@ -134,7 +134,7 @@ class ContentOrchestrator:
                 "message": f"Waiting for human action at '{stage_def.label}'",
             }
 
-        # For agent/auto stages, execute the agent
+        # For agent/both stages, execute the agent
         if stage_def.agent_name:
             return await self._execute_agent_stage(current_key, stage_def, actor_id)
 
