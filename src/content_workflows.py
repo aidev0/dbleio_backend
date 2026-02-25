@@ -3107,10 +3107,7 @@ Storyboards:
 {storyboard_summary if storyboard_summary else "No storyboards generated yet."}
 
 VIDEO BEING EVALUATED: {video_desc}
-{f"""
-PERSONAS (use these as additional context for scoring):
-{persona_context}
-""" if persona_context else ""}
+{("PERSONAS (use these as additional context for scoring):\n" + persona_context + "\n") if persona_context else ""}
 DEMOGRAPHIC SEGMENTS TO SCORE:
 {combos_str}
 
