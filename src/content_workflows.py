@@ -92,6 +92,236 @@ class GenerateVideoRequest(BaseModel):
 
 # --- Helpers ---
 
+
+def _build_visual_style_context(research: dict) -> str:
+    """
+    Extract visual style insights from research data for storyboard/image generation.
+    Focuses on colors, textures, objects, characters, lighting, and shot types.
+    """
+    from collections import Counter
+
+    colors_all, textures_all, objects_all, characters_all = [], [], [], []
+    formats_all, music_all = [], []
+
+    def _collect_from_performers(performers: list):
+        for p in performers:
+            ai = p.get("ai_analysis")
+            if not ai or "error" in ai:
+                continue
+            if ai.get("colors"):
+                colors_all.extend(ai["colors"] if isinstance(ai["colors"], list) else [ai["colors"]])
+            if ai.get("textures"):
+                textures_all.extend(ai["textures"] if isinstance(ai["textures"], list) else [ai["textures"]])
+            if ai.get("objects"):
+                objects_all.extend(ai["objects"] if isinstance(ai["objects"], list) else [ai["objects"]])
+            if ai.get("content_format"):
+                formats_all.append(ai["content_format"])
+            if ai.get("music_style"):
+                music_all.append(ai["music_style"])
+            if ai.get("characters") and isinstance(ai["characters"], list):
+                for c in ai["characters"]:
+                    if isinstance(c, dict):
+                        characters_all.append(f"{c.get('gender', '')} {c.get('age_range', '')} — {c.get('description', '')}")
+                    elif isinstance(c, str):
+                        characters_all.append(c)
+
+    # Collect from brand and competitor performers
+    brand_ig = research.get("brand_instagram")
+    if brand_ig and isinstance(brand_ig, dict):
+        _collect_from_performers(brand_ig.get("top_performers", []))
+    comp_ig = research.get("competitor_instagram", {})
+    if isinstance(comp_ig, dict):
+        for comp_data in comp_ig.values():
+            if isinstance(comp_data, dict):
+                _collect_from_performers(comp_data.get("top_performers", []))
+
+    lines = []
+    color_counts = Counter(colors_all)
+    if color_counts:
+        lines.append(f"Dominant colors in top content: {', '.join(c for c, _ in color_counts.most_common(8))}")
+    texture_counts = Counter(textures_all)
+    if texture_counts:
+        lines.append(f"Visual textures: {', '.join(t for t, _ in texture_counts.most_common(6))}")
+    obj_counts = Counter(objects_all)
+    if obj_counts:
+        lines.append(f"Common objects/props: {', '.join(o for o, _ in obj_counts.most_common(8))}")
+    if characters_all:
+        lines.append(f"Character types seen: {'; '.join(characters_all[:5])}")
+    fmt_counts = Counter(formats_all)
+    if fmt_counts:
+        lines.append(f"Top content formats: {', '.join(f for f, _ in fmt_counts.most_common(4))}")
+
+    if not lines:
+        return ""
+    return "VISUAL STYLE FROM RESEARCH (top-performing content in this niche):\n" + "\n".join(lines)
+
+
+def _build_research_context(research: dict) -> str:
+    """
+    Build a rich, structured context string from research data for concept generation.
+    Extracts AI video analysis patterns, brand insights, competitor insights, and trends.
+    """
+    parts = []
+
+    # --- Brand URL analysis ---
+    brand_url = research.get("brand_url_analysis")
+    if brand_url and isinstance(brand_url, dict) and "error" not in brand_url:
+        brand_bits = []
+        for key in ("brand_voice", "messaging_themes", "target_audience", "products", "colors", "fonts"):
+            val = brand_url.get(key)
+            if val:
+                brand_bits.append(f"  {key}: {val if isinstance(val, str) else ', '.join(val) if isinstance(val, list) else str(val)}")
+        if brand_bits:
+            parts.append("BRAND IDENTITY (from website):\n" + "\n".join(brand_bits))
+
+    # --- Extract AI analysis patterns from top performers ---
+    def _extract_ai_patterns(performers: list, label: str) -> str:
+        """Summarize AI analysis patterns across top performers."""
+        analyzed = [p for p in performers if p.get("ai_analysis") and "error" not in p.get("ai_analysis", {})]
+        if not analyzed:
+            return ""
+
+        hooks, formats, durations, colors_all, textures_all, objects_all = [], [], [], [], [], []
+        music_styles, ctas, characters_all, transcripts = [], [], [], []
+
+        for p in analyzed:
+            ai = p["ai_analysis"]
+            if ai.get("hook_type"):
+                hooks.append(ai["hook_type"])
+            if ai.get("hook_text"):
+                hooks.append(f'"{ai["hook_text"]}"')
+            if ai.get("content_format"):
+                formats.append(ai["content_format"])
+            if ai.get("duration"):
+                durations.append(str(ai["duration"]))
+            if ai.get("colors"):
+                colors_all.extend(ai["colors"] if isinstance(ai["colors"], list) else [ai["colors"]])
+            if ai.get("textures"):
+                textures_all.extend(ai["textures"] if isinstance(ai["textures"], list) else [ai["textures"]])
+            if ai.get("objects"):
+                objects_all.extend(ai["objects"] if isinstance(ai["objects"], list) else [ai["objects"]])
+            if ai.get("music_style"):
+                music_styles.append(ai["music_style"])
+            if ai.get("cta"):
+                ctas.append(ai["cta"])
+            if ai.get("characters") and isinstance(ai["characters"], list):
+                for c in ai["characters"]:
+                    if isinstance(c, dict):
+                        characters_all.append(f"{c.get('gender', '')} {c.get('age_range', '')} — {c.get('description', '')}")
+                    elif isinstance(c, str):
+                        characters_all.append(c)
+            if ai.get("transcription"):
+                transcripts.append(ai["transcription"][:150])
+
+        lines = [f"{label} — {len(analyzed)} reels analyzed:"]
+
+        # Count frequencies for hooks and formats
+        from collections import Counter
+        hook_counts = Counter([h for h in hooks if not h.startswith('"')])
+        if hook_counts:
+            lines.append(f"  Hook types: {', '.join(f'{h} ({c}x)' for h, c in hook_counts.most_common(5))}")
+        hook_examples = [h for h in hooks if h.startswith('"')][:3]
+        if hook_examples:
+            lines.append(f"  Hook examples: {'; '.join(hook_examples)}")
+
+        fmt_counts = Counter(formats)
+        if fmt_counts:
+            lines.append(f"  Content formats: {', '.join(f'{f} ({c}x)' for f, c in fmt_counts.most_common(5))}")
+
+        if durations:
+            lines.append(f"  Durations: {', '.join(set(durations))}")
+
+        color_counts = Counter(colors_all)
+        if color_counts:
+            lines.append(f"  Dominant colors: {', '.join(c for c, _ in color_counts.most_common(8))}")
+
+        texture_counts = Counter(textures_all)
+        if texture_counts:
+            lines.append(f"  Textures: {', '.join(t for t, _ in texture_counts.most_common(6))}")
+
+        obj_counts = Counter(objects_all)
+        if obj_counts:
+            lines.append(f"  Common objects: {', '.join(o for o, _ in obj_counts.most_common(8))}")
+
+        music_counts = Counter(music_styles)
+        if music_counts:
+            lines.append(f"  Music styles: {', '.join(m for m, _ in music_counts.most_common(5))}")
+
+        if characters_all:
+            lines.append(f"  Characters seen: {'; '.join(characters_all[:6])}")
+
+        cta_counts = Counter(c for c in ctas if c and c.lower() != "none")
+        if cta_counts:
+            lines.append(f"  CTAs used: {', '.join(c for c, _ in cta_counts.most_common(5))}")
+
+        if transcripts:
+            lines.append(f"  Sample transcripts: {' | '.join(transcripts[:2])}")
+
+        return "\n".join(lines)
+
+    # --- Brand Instagram ---
+    brand_ig = research.get("brand_instagram")
+    if brand_ig and isinstance(brand_ig, dict) and "error" not in brand_ig:
+        username = brand_ig.get("username", "brand")
+        followers = brand_ig.get("followers", 0)
+        total = brand_ig.get("total_reels", 0)
+        top = brand_ig.get("top_performers", [])
+        parts.append(f"BRAND INSTAGRAM @{username}: {followers:,} followers, {total} reels, top {len(top)} performers")
+
+        # Top performer stats
+        if top:
+            avg_views = sum(p.get("videoPlayCount", 0) or 0 for p in top) / len(top)
+            avg_likes = sum(p.get("likesCount", 0) or 0 for p in top) / len(top)
+            parts.append(f"  Top performer avg: {avg_views:,.0f} views, {avg_likes:,.0f} likes")
+
+        ai_summary = _extract_ai_patterns(top, f"BRAND AI ANALYSIS (@{username})")
+        if ai_summary:
+            parts.append(ai_summary)
+
+    # --- Competitor Instagram ---
+    comp_ig = research.get("competitor_instagram", {})
+    if isinstance(comp_ig, dict):
+        for comp_user, comp_data in comp_ig.items():
+            if not comp_data or not isinstance(comp_data, dict) or "error" in comp_data:
+                continue
+            followers = comp_data.get("followers", 0)
+            total = comp_data.get("total_reels", 0)
+            top = comp_data.get("top_performers", [])
+            parts.append(f"COMPETITOR @{comp_user}: {followers:,} followers, {total} reels, top {len(top)} performers")
+
+            if top:
+                avg_views = sum(p.get("videoPlayCount", 0) or 0 for p in top) / len(top)
+                avg_likes = sum(p.get("likesCount", 0) or 0 for p in top) / len(top)
+                parts.append(f"  Top performer avg: {avg_views:,.0f} views, {avg_likes:,.0f} likes")
+
+            ai_summary = _extract_ai_patterns(top, f"COMPETITOR AI ANALYSIS (@{comp_user})")
+            if ai_summary:
+                parts.append(ai_summary)
+
+            # Success analysis
+            success = comp_data.get("success_analysis")
+            if success and isinstance(success, str):
+                parts.append(f"COMPETITIVE SUCCESS INSIGHT (@{comp_user}):\n  {success[:400]}")
+
+    # --- Financial context ---
+    financial = research.get("financial", {})
+    if isinstance(financial, dict):
+        for co_key, fin_data in financial.items():
+            if not fin_data or not isinstance(fin_data, dict):
+                continue
+            bits = []
+            for k in ("revenue", "market_cap", "stock_price", "employees", "revenue_growth"):
+                v = fin_data.get(k)
+                if v:
+                    bits.append(f"{k}: {v}")
+            if bits:
+                parts.append(f"FINANCIAL ({co_key}): {', '.join(bits)}")
+
+    if not parts:
+        return ""
+    return "--- RESEARCH DATA ---\n" + "\n\n".join(parts) + "\n--- END RESEARCH DATA ---"
+
+
 def _workflow_helper(doc) -> dict:
     if not doc:
         return {}
@@ -443,7 +673,8 @@ STAGE_ORDER = [
 AVAILABLE_STAGES = {
     "brand", "campaign_strategy", "scheduling", "concepts",
     "image_generation", "storyboard", "video_generation",
-    "simulation_testing",
+    "simulation_testing", "predictive_modeling", "content_ranking",
+    "fdm_review", "brand_qa",
 }
 
 
@@ -612,13 +843,16 @@ async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, req
         if audience:
             context_parts.append(f"Audience: {audience.get('name', '')}. Demographics: {audience.get('demographics', '')}. Interests: {audience.get('interests', '')}")
 
+        # Pull rich research data from workflow config
+        research = config.get("stage_settings", {}).get("research", {})
+        if research:
+            context_parts.append(_build_research_context(research))
+
         # Check prior stage outputs from workflow state
         try:
             from src.content_generation.state import WorkflowStateStore
             state = WorkflowStateStore.load(workflow_id)
             if state:
-                if state.get("research"):
-                    context_parts.append(f"Research findings: {str(state['research'])[:500]}")
                 if state.get("strategy_assets"):
                     context_parts.append(f"Strategy assets: {str(state['strategy_assets'])[:500]}")
         except Exception:
@@ -751,12 +985,21 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         concepts_output = state_data.get("stage_outputs", {}).get("concepts", {})
         concepts_list = concepts_output.get("concepts", [])
 
-        # Also check stageSettings saved concepts
+        # Also check stageSettings saved concepts (per-piece first, then top-level fallback)
         config = workflow.get("config") or {}
         stage_settings = config.get("stage_settings", {})
-        generated_concepts = stage_settings.get("concepts", {}).get("generated_concepts", [])
-        if not concepts_list and generated_concepts:
-            concepts_list = generated_concepts
+        concepts_settings = stage_settings.get("concepts", {})
+        # Try all pieces to find concepts
+        if not concepts_list:
+            for piece_data in concepts_settings.get("pieces", {}).values():
+                piece_concepts = piece_data.get("generated_concepts", [])
+                if piece_concepts:
+                    concepts_list = piece_concepts
+                    break
+        if not concepts_list:
+            generated_concepts = concepts_settings.get("generated_concepts", [])
+            if generated_concepts:
+                concepts_list = generated_concepts
 
         if body.concept_index < 0 or body.concept_index >= len(concepts_list):
             raise HTTPException(status_code=400, detail=f"Invalid concept_index {body.concept_index}. Available: 0-{len(concepts_list)-1}")
@@ -770,9 +1013,15 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         if brand:
             brand_context = f"Brand: {brand.get('name', '')} — {brand.get('industry', '')}. {brand.get('description', '')}. Product: {brand.get('product', '')}"
 
+        # Gather research visual style context
+        research_data = stage_settings.get("research", {})
+        research_visual_context = _build_visual_style_context(research_data) if research_data else ""
+
         system_prompt = f"""You are a creative director specializing in short-form video content. Generate a detailed storyboard for this concept.
 
 {brand_context}
+
+{research_visual_context}
 
 Concept: {json.dumps(concept)}
 
@@ -780,6 +1029,7 @@ Create a detailed storyboard that breaks this concept into filmable scenes. You 
 1. First define all CHARACTERS with detailed, consistent visual descriptions. Each character's description must be specific enough to generate consistent AI images (age, ethnicity, build, hair, clothing, etc.)
 2. Then create SCENES that reference these characters. Each scene's image_prompt should incorporate the character's visual descriptions for consistency.
 3. Give each scene a shot type (close-up, medium, wide, over-shoulder, etc.) and duration hint.
+4. Use the visual style insights from research (colors, textures, lighting, shot types, objects) to inform your image_prompt descriptions so they match the proven aesthetic of top-performing content in this niche.
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -1085,7 +1335,9 @@ async def generate_storyboard_image(
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
-        _verify_workflow_access(workflow_id, workos_user_id)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+        config = workflow.get("config", {})
+        stage_settings = config.get("stage_settings", {})
 
         # Load storyboard from node output_data
         storyboard_node = db.content_workflow_nodes.find_one({
@@ -1154,7 +1406,17 @@ async def generate_storyboard_image(
         if not image_prompt:
             raise HTTPException(status_code=400, detail="No image_prompt found for target")
 
-        image_model = body.image_model or target.get("image_model", "google/nano-banana-pro")
+        # Enrich image prompt with visual style from research
+        research_data = stage_settings.get("research", {})
+        if research_data:
+            visual_ctx = _build_visual_style_context(research_data)
+            if visual_ctx:
+                # Append compact style hint to the image prompt
+                style_lines = [l for l in visual_ctx.split("\n")[1:] if l.strip()]  # skip header
+                style_hint = ". ".join(style_lines[:3])  # keep compact for image model
+                image_prompt = f"{image_prompt}. Style reference: {style_hint}"
+
+        image_model = body.image_model or target.get("image_model", "google/nano-banana")
 
         # Create background task
         import uuid
@@ -1451,7 +1713,16 @@ async def generate_concept_image(
         if not image_prompt:
             raise HTTPException(status_code=400, detail="No image description found for this concept")
 
-        image_model = body.image_model or "google/nano-banana-pro"
+        # Enrich image prompt with visual style from research
+        research_data = stage_settings.get("research", {})
+        if research_data:
+            visual_ctx = _build_visual_style_context(research_data)
+            if visual_ctx:
+                style_lines = [l for l in visual_ctx.split("\n")[1:] if l.strip()]
+                style_hint = ". ".join(style_lines[:3])
+                image_prompt = f"{image_prompt}. Style reference: {style_hint}"
+
+        image_model = body.image_model or "google/nano-banana"
 
         # Create background task
         from src.task_manager import task_manager
@@ -2060,6 +2331,7 @@ async def list_video_jobs(workflow_id: str, request: Request):
                 "task_id": j.get("task_id", ""),
                 "model": j.get("model", ""),
                 "status": j.get("status", ""),
+                "temperature": j.get("temperature"),
                 "scenes_total": len(videos),
                 "scenes_done": done,
                 "scenes_failed": failed,
@@ -2707,6 +2979,7 @@ class RunSimulationRequest(BaseModel):
     model_provider: str = "google"
     model_name: str = "gemini-2.5-flash"
     persona_ids: Optional[List[str]] = None
+    video_ids: Optional[List[str]] = None  # specific video variation IDs; None = all
 
 
 @router.post("/{workflow_id}/simulate")
@@ -2742,7 +3015,14 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
             storyboard_summary += f"- Storyline: {sb.get('storyline', '')[:200]}\n"
             storyboard_summary += f"  Scenes: {len(sb.get('scenes', []))} cuts\n"
 
-        video_count = len(video_output.get("variations", []))
+        all_variations = video_output.get("variations", [])
+        # Get full videos (stitched + video types) for simulation
+        full_videos = [v for v in all_variations if v.get("type") in ("stitched", "video") and v.get("preview")]
+        if body.video_ids:
+            full_videos = [v for v in full_videos if v.get("id") in body.video_ids]
+        # Fallback: if no full videos, use all variations
+        if not full_videos:
+            full_videos = [{"id": "all", "title": "All Content", "model": "", "type": "all"}]
 
         # Fetch persona context if persona_ids provided
         persona_context = ""
@@ -2772,10 +3052,47 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
         for g in body.genders:
             for a in body.ages:
                 combos.append({"gender": g, "age": a})
-
         combos_str = json.dumps(combos)
 
-        prompt = f"""You are an expert marketing analyst. Score how well this video content would resonate with each demographic segment.
+        # Resolve provider from model name
+        llm_model = body.model_name
+        provider = body.model_provider
+        if not provider:
+            if llm_model.startswith("gemini") or llm_model == "gemini-pro-3":
+                provider = "google"
+            elif llm_model.startswith("gpt") or llm_model.startswith("o1"):
+                provider = "openai"
+            elif llm_model.startswith("claude"):
+                provider = "anthropic"
+            else:
+                provider = "google"
+
+        model_map = {
+            "gemini-pro-3": "gemini-2.5-pro",
+            "claude-4.5-sonnet": "claude-sonnet-4.5",
+            "gpt-5.2": "gpt-4o",
+        }
+        mapped_model = model_map.get(llm_model, llm_model)
+
+        from src.ai_agent import evaluate_with_openai, evaluate_with_anthropic, evaluate_with_google
+
+        # Run simulation per video
+        all_results = []
+        for vid in full_videos:
+            vid_id = vid.get("id", "all")
+            vid_title = vid.get("title", "All Content")
+            vid_model = vid.get("model", "")
+            vid_type = vid.get("type", "")
+
+            video_desc = f"{vid_title}"
+            if vid_model:
+                video_desc += f" (generated with {vid_model})"
+            if vid_type == "stitched":
+                video_desc += " — full stitched video from all scenes"
+            elif vid_type == "video":
+                video_desc += " — complete video"
+
+            prompt = f"""You are an expert marketing analyst. Score how well this specific video would resonate with each demographic segment.
 
 BRAND: {brand_name}
 {f"Brand Description: {brand_description}" if brand_description else ""}
@@ -2789,7 +3106,7 @@ Concepts:
 Storyboards:
 {storyboard_summary if storyboard_summary else "No storyboards generated yet."}
 
-Videos: {video_count} variations generated.
+VIDEO BEING EVALUATED: {video_desc}
 {f"""
 PERSONAS (use these as additional context for scoring):
 {persona_context}
@@ -2812,53 +3129,29 @@ Score based on:
 - Messaging effectiveness for the gender/age combination
 """
 
-        # Resolve provider from model name (same pattern as storyboard generation)
-        llm_model = body.model_name
-        provider = body.model_provider
-
-        # Auto-detect provider from model name if not explicitly set
-        if not provider:
-            if llm_model.startswith("gemini") or llm_model == "gemini-pro-3":
-                provider = "google"
-            elif llm_model.startswith("gpt") or llm_model.startswith("o1"):
-                provider = "openai"
-            elif llm_model.startswith("claude"):
-                provider = "anthropic"
+            result = None
+            if provider == "openai":
+                result = evaluate_with_openai(prompt, mapped_model)
+            elif provider == "anthropic":
+                result = evaluate_with_anthropic(prompt, mapped_model)
+            elif provider == "google":
+                result = evaluate_with_google(prompt, mapped_model)
             else:
-                provider = "google"  # default
+                raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
 
-        # Map frontend model names to actual API model names
-        model_map = {
-            "gemini-pro-3": "gemini-2.5-pro",
-            "claude-4.5-sonnet": "claude-sonnet-4.5",
-            "gpt-5.2": "gpt-4o",
-        }
-        mapped_model = model_map.get(llm_model, llm_model)
+            if not result:
+                continue
 
-        # Call LLM using existing evaluate functions
-        from src.ai_agent import evaluate_with_openai, evaluate_with_anthropic, evaluate_with_google
+            vid_results = result.get("results", [])
+            for r in vid_results:
+                r["score"] = max(0, min(100, int(r.get("score", 0))))
+                r["video_id"] = vid_id
+                r["video_title"] = vid_title
+            all_results.extend(vid_results)
 
-        result = None
-        if provider == "openai":
-            result = evaluate_with_openai(prompt, mapped_model)
-        elif provider == "anthropic":
-            result = evaluate_with_anthropic(prompt, mapped_model)
-        elif provider == "google":
-            result = evaluate_with_google(prompt, mapped_model)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
-
-        if not result:
-            raise HTTPException(status_code=500, detail="LLM returned no result")
-
-        # Extract results array
-        results = result.get("results", [])
+        results = all_results
         if not results:
-            raise HTTPException(status_code=500, detail="LLM response missing results array")
-
-        # Ensure scores are integers 0-100
-        for r in results:
-            r["score"] = max(0, min(100, int(r.get("score", 0))))
+            raise HTTPException(status_code=500, detail="LLM returned no results for any video")
 
         # Save to simulation_testing node output_data
         sim_node = db.content_workflow_nodes.find_one({
@@ -2907,14 +3200,407 @@ Score based on:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Predictive Modeling ---
+
+
+def _compute_research_benchmarks(config: dict) -> dict:
+    """Extract avg views/likes/comments/engagement from research data."""
+    stage_settings = config.get("stage_settings", {})
+    research = stage_settings.get("research", {})
+
+    def _avg_kpis(performers: list) -> dict:
+        if not performers:
+            return {"avg_views": 0, "avg_likes": 0, "avg_comments": 0, "count": 0}
+        total_views = sum(p.get("videoPlayCount", 0) for p in performers)
+        total_likes = sum(p.get("likesCount", 0) for p in performers)
+        total_comments = sum(p.get("commentsCount", 0) for p in performers)
+        n = len(performers)
+        return {
+            "avg_views": round(total_views / n) if n else 0,
+            "avg_likes": round(total_likes / n) if n else 0,
+            "avg_comments": round(total_comments / n) if n else 0,
+            "count": n,
+        }
+
+    benchmarks = {}
+
+    brand_ig = research.get("brand_instagram")
+    if brand_ig and isinstance(brand_ig, dict):
+        followers = brand_ig.get("followers", 0)
+        kpis = _avg_kpis(brand_ig.get("top_performers", []))
+        kpis["followers"] = followers
+        if followers and kpis["avg_views"]:
+            kpis["engagement_rate"] = round(
+                (kpis["avg_likes"] + kpis["avg_comments"]) / followers * 100, 2
+            )
+        else:
+            kpis["engagement_rate"] = 0
+        benchmarks["brand"] = kpis
+
+    comp_ig = research.get("competitor_instagram", {})
+    if isinstance(comp_ig, dict):
+        comp_benchmarks = {}
+        for comp_user, comp_data in comp_ig.items():
+            if isinstance(comp_data, dict) and "error" not in comp_data:
+                followers = comp_data.get("followers", 0)
+                kpis = _avg_kpis(comp_data.get("top_performers", []))
+                kpis["followers"] = followers
+                if followers and kpis["avg_views"]:
+                    kpis["engagement_rate"] = round(
+                        (kpis["avg_likes"] + kpis["avg_comments"]) / followers * 100, 2
+                    )
+                else:
+                    kpis["engagement_rate"] = 0
+                comp_benchmarks[comp_user] = kpis
+        if comp_benchmarks:
+            benchmarks["competitors"] = comp_benchmarks
+
+    return benchmarks
+
+
+class PredictRequest(BaseModel):
+    model_name: str = "gemini-pro-3"
+    video_ids: Optional[List[str]] = None
+
+
+@router.post("/{workflow_id}/predict")
+async def run_predictive_modeling(workflow_id: str, body: PredictRequest, request: Request):
+    """Run LLM-based predictive modeling to forecast KPIs for each video."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        config = workflow.get("config") or {}
+
+        # Gather context
+        brand = db.brands.find_one({"_id": ObjectId(workflow["brand_id"])}) if workflow.get("brand_id") else None
+        brand_name = brand.get("name", "Unknown Brand") if brand else "Unknown Brand"
+        brand_description = brand.get("description", "") if brand else ""
+
+        campaign_id = config.get("campaign_id")
+        campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)}) if campaign_id else None
+        campaign_name = campaign.get("name", "") if campaign else ""
+        campaign_goal = campaign.get("campaign_goal", "") if campaign else ""
+
+        nodes = {n["stage_key"]: n for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
+        concepts_output = nodes.get("concepts", {}).get("output_data", {})
+        storyboard_output = nodes.get("storyboard", {}).get("output_data", {})
+        video_output = nodes.get("video_generation", {}).get("output_data", {})
+
+        concepts_summary = ""
+        for c in concepts_output.get("concepts", [])[:3]:
+            concepts_summary += f"- {c.get('title', 'Untitled')}: {c.get('hook', '')}\n"
+
+        storyboard_summary = ""
+        for sb in storyboard_output.get("storyboards", [])[:2]:
+            storyboard_summary += f"- Storyline: {sb.get('storyline', '')[:200]}\n"
+            storyboard_summary += f"  Scenes: {len(sb.get('scenes', []))} cuts\n"
+
+        # Get stitched/video variations
+        all_variations = video_output.get("variations", [])
+        full_videos = [v for v in all_variations if v.get("type") in ("stitched", "video") and v.get("preview")]
+        if body.video_ids:
+            full_videos = [v for v in full_videos if v.get("id") in body.video_ids]
+        if not full_videos:
+            raise HTTPException(status_code=400, detail="No stitched/video variations found to predict for")
+
+        # Research benchmarks
+        benchmarks = _compute_research_benchmarks(config)
+        brand_bench = benchmarks.get("brand", {})
+        comp_bench = benchmarks.get("competitors", {})
+
+        benchmark_context = ""
+        if brand_bench:
+            benchmark_context += f"\nBRAND BENCHMARKS (from top-performing reels):\n"
+            benchmark_context += f"  Followers: {brand_bench.get('followers', 'N/A'):,}\n"
+            benchmark_context += f"  Avg Views: {brand_bench.get('avg_views', 0):,}\n"
+            benchmark_context += f"  Avg Likes: {brand_bench.get('avg_likes', 0):,}\n"
+            benchmark_context += f"  Avg Comments: {brand_bench.get('avg_comments', 0):,}\n"
+            benchmark_context += f"  Engagement Rate: {brand_bench.get('engagement_rate', 0)}%\n"
+
+        if comp_bench:
+            benchmark_context += "\nCOMPETITOR BENCHMARKS:\n"
+            for comp_user, kpis in comp_bench.items():
+                benchmark_context += f"  {comp_user}: {kpis.get('followers', 0):,} followers, avg views {kpis.get('avg_views', 0):,}, avg likes {kpis.get('avg_likes', 0):,}, engagement {kpis.get('engagement_rate', 0)}%\n"
+
+        # Resolve provider/model
+        llm_model = body.model_name
+        if llm_model.startswith("gemini") or llm_model == "gemini-pro-3":
+            provider = "google"
+        elif llm_model.startswith("gpt") or llm_model.startswith("o1"):
+            provider = "openai"
+        elif llm_model.startswith("claude"):
+            provider = "anthropic"
+        else:
+            provider = "google"
+
+        model_map = {
+            "gemini-pro-3": "gemini-2.5-pro",
+            "claude-4.5-sonnet": "claude-sonnet-4.5",
+            "gpt-5.2": "gpt-4o",
+        }
+        mapped_model = model_map.get(llm_model, llm_model)
+
+        from src.ai_agent import evaluate_with_openai, evaluate_with_anthropic, evaluate_with_google
+
+        predictions = []
+        for vid in full_videos:
+            vid_id = vid.get("id", "unknown")
+            vid_title = vid.get("title", "Untitled")
+            vid_model = vid.get("model", "")
+            vid_type = vid.get("type", "")
+
+            video_desc = f"{vid_title}"
+            if vid_model:
+                video_desc += f" (generated with {vid_model})"
+            if vid_type == "stitched":
+                video_desc += " — full stitched video from all scenes"
+
+            prompt = f"""You are an expert social media marketing analyst specializing in Instagram Reels performance prediction.
+
+Given the brand context, content details, and real Instagram benchmark data below, predict the expected performance KPIs for this specific video if posted as an Instagram Reel.
+
+BRAND: {brand_name}
+{f"Brand Description: {brand_description}" if brand_description else ""}
+{f"Campaign: {campaign_name}" if campaign_name else ""}
+{f"Campaign Goal: {campaign_goal}" if campaign_goal else ""}
+
+CONTENT CONTEXT:
+Concepts:
+{concepts_summary if concepts_summary else "No concepts available."}
+
+Storyboards:
+{storyboard_summary if storyboard_summary else "No storyboards available."}
+
+VIDEO BEING EVALUATED: {video_desc}
+{benchmark_context}
+
+Based on the benchmark data and content analysis, predict the following KPIs for this video:
+
+Return ONLY a JSON object with this exact structure:
+{{"expected_views": <int>, "expected_likes": <int>, "expected_comments": <int>, "engagement_rate": <float percent>, "confidence": <float 0-1>, "reasoning": "<2-3 sentence explanation>", "strengths": ["<strength1>", "<strength2>"], "risks": ["<risk1>", "<risk2>"]}}
+
+Guidelines:
+- Base predictions on the brand's actual benchmark data
+- Consider the content type, hook quality, and production value
+- engagement_rate = (likes + comments) / followers * 100
+- confidence should reflect how similar this content is to successful benchmarks
+- Be realistic — don't inflate numbers beyond what benchmarks suggest is achievable"""
+
+            result = None
+            if provider == "openai":
+                result = evaluate_with_openai(prompt, mapped_model)
+            elif provider == "anthropic":
+                result = evaluate_with_anthropic(prompt, mapped_model)
+            elif provider == "google":
+                result = evaluate_with_google(prompt, mapped_model)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+            if result:
+                result["video_id"] = vid_id
+                result["video_title"] = vid_title
+                # Clamp values
+                for k in ("expected_views", "expected_likes", "expected_comments"):
+                    result[k] = max(0, int(result.get(k, 0)))
+                result["engagement_rate"] = round(max(0, float(result.get("engagement_rate", 0))), 2)
+                result["confidence"] = round(max(0, min(1, float(result.get("confidence", 0.5)))), 2)
+                predictions.append(result)
+
+        if not predictions:
+            raise HTTPException(status_code=500, detail="LLM returned no predictions")
+
+        # Save to predictive_modeling node
+        output_data = {
+            "predictions": predictions,
+            "benchmarks": benchmarks,
+            "model_name": llm_model,
+            "run_at": datetime.utcnow().isoformat(),
+        }
+        pred_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "predictive_modeling",
+        })
+        if pred_node:
+            db.content_workflow_nodes.update_one(
+                {"_id": pred_node["_id"]},
+                {"$set": {
+                    "output_data": output_data,
+                    "status": "completed",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        else:
+            stage_index = STAGE_ORDER.index("predictive_modeling") if "predictive_modeling" in STAGE_ORDER else 9
+            db.content_workflow_nodes.insert_one({
+                "workflow_id": workflow_id,
+                "stage_key": "predictive_modeling",
+                "stage_index": stage_index,
+                "stage_type": "agent",
+                "status": "completed",
+                "input_data": {},
+                "output_data": output_data,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+
+        _recalculate_current_stage(workflow_id)
+        return {"predictions": predictions, "benchmarks": benchmarks}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Content Ranking ---
+
+
+class RankRequest(BaseModel):
+    simulation_weight: float = Field(default=0.4, ge=0, le=1)
+    prediction_weight: float = Field(default=0.6, ge=0, le=1)
+
+
+@router.post("/{workflow_id}/rank")
+async def run_content_ranking(workflow_id: str, body: RankRequest, request: Request):
+    """Deterministic content ranking combining simulation scores + predicted KPIs."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        nodes = {n["stage_key"]: n for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
+
+        # Get simulation results
+        sim_output = nodes.get("simulation_testing", {}).get("output_data", {})
+        sim_results = sim_output.get("results", [])
+
+        # Also check for test-based results
+        sim_tests = sim_output.get("tests", [])
+        for t in sim_tests:
+            if isinstance(t, dict) and t.get("results"):
+                sim_results.extend(t["results"])
+
+        # Get prediction results
+        pred_output = nodes.get("predictive_modeling", {}).get("output_data", {})
+        predictions = pred_output.get("predictions", [])
+
+        if not predictions:
+            raise HTTPException(status_code=400, detail="No prediction results found. Run Predictive Modeling first.")
+
+        # Compute avg simulation score per video
+        sim_scores_by_video = {}
+        for r in sim_results:
+            vid_id = r.get("video_id", "all")
+            sim_scores_by_video.setdefault(vid_id, []).append(r.get("score", 0))
+
+        sim_avg_by_video = {}
+        for vid_id, scores in sim_scores_by_video.items():
+            sim_avg_by_video[vid_id] = sum(scores) / len(scores) if scores else 0
+
+        # Compute normalized prediction score per video (0-100 scale)
+        # Based on how predicted engagement compares to benchmarks
+        benchmarks = pred_output.get("benchmarks", {})
+        brand_bench = benchmarks.get("brand", {})
+        brand_avg_views = brand_bench.get("avg_views", 1) or 1
+        brand_avg_likes = brand_bench.get("avg_likes", 1) or 1
+
+        pred_scores = {}
+        for p in predictions:
+            vid_id = p.get("video_id", "unknown")
+            # Score based on: confidence * (predicted performance vs benchmark ratio), clamped to 0-100
+            view_ratio = min(p.get("expected_views", 0) / brand_avg_views, 2.0)  # cap at 2x benchmark
+            like_ratio = min(p.get("expected_likes", 0) / brand_avg_likes, 2.0)
+            confidence = p.get("confidence", 0.5)
+            # Weighted average of ratios, scaled to 0-100
+            raw_score = (view_ratio * 0.5 + like_ratio * 0.3 + confidence * 0.2) * 50
+            pred_scores[vid_id] = round(min(100, max(0, raw_score)), 1)
+
+        # Normalize weights
+        total_weight = body.simulation_weight + body.prediction_weight
+        sim_w = body.simulation_weight / total_weight if total_weight > 0 else 0.4
+        pred_w = body.prediction_weight / total_weight if total_weight > 0 else 0.6
+
+        # Build ranked list
+        ranked = []
+        for p in predictions:
+            vid_id = p.get("video_id", "unknown")
+            sim_score = sim_avg_by_video.get(vid_id, sim_avg_by_video.get("all", 50))
+            pred_score = pred_scores.get(vid_id, 50)
+            composite = round(sim_w * sim_score + pred_w * pred_score, 1)
+
+            ranked.append({
+                "video_id": vid_id,
+                "video_title": p.get("video_title", "Untitled"),
+                "composite_score": composite,
+                "simulation_score": round(sim_score, 1),
+                "prediction_score": pred_score,
+                "expected_views": p.get("expected_views", 0),
+                "expected_likes": p.get("expected_likes", 0),
+                "expected_comments": p.get("expected_comments", 0),
+                "engagement_rate": p.get("engagement_rate", 0),
+                "confidence": p.get("confidence", 0),
+                "reasoning": p.get("reasoning", ""),
+            })
+
+        ranked.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        # Add rank numbers
+        for i, r in enumerate(ranked):
+            r["rank"] = i + 1
+
+        # Save to content_ranking node
+        output_data = {
+            "rankings": ranked,
+            "weights": {"simulation": sim_w, "prediction": pred_w},
+            "run_at": datetime.utcnow().isoformat(),
+        }
+        rank_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "content_ranking",
+        })
+        if rank_node:
+            db.content_workflow_nodes.update_one(
+                {"_id": rank_node["_id"]},
+                {"$set": {
+                    "output_data": output_data,
+                    "status": "completed",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        else:
+            stage_index = STAGE_ORDER.index("content_ranking") if "content_ranking" in STAGE_ORDER else 10
+            db.content_workflow_nodes.insert_one({
+                "workflow_id": workflow_id,
+                "stage_key": "content_ranking",
+                "stage_index": stage_index,
+                "stage_type": "agent",
+                "status": "completed",
+                "input_data": {},
+                "output_data": output_data,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+
+        _recalculate_current_stage(workflow_id)
+        return {"rankings": ranked, "weights": {"simulation": sim_w, "prediction": pred_w}}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Helpers ---
 
 def _verify_workflow_access(workflow_id: str, workos_user_id: str):
-    """Verify user has access to this workflow's organization."""
+    """Verify user has access to this workflow's organization. API key bypasses org check."""
     workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    from src.role_helpers import verify_org_membership
-    verify_org_membership(db, workflow["organization_id"], workos_user_id)
+    if workos_user_id != "api_key":
+        from src.role_helpers import verify_org_membership
+        verify_org_membership(db, workflow["organization_id"], workos_user_id)
     return workflow

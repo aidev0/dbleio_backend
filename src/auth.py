@@ -288,13 +288,17 @@ def get_workos_user_id(request: Request) -> Optional[str]:
 def require_user_id(request: Request) -> str:
     """
     Require and return the WorkOS user ID from the authenticated user.
-    Raises HTTPException if not authenticated with JWT.
-    Use this for routes that require user identity.
+    Falls back to 'api_key' if authenticated via API key (no JWT).
+    Raises HTTPException if not authenticated at all.
     """
     user_id = get_workos_user_id(request)
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User authentication required. Please log in.",
-        )
-    return user_id
+    if user_id:
+        return user_id
+    # Accept API key auth — middleware already validated it
+    api_key = request.headers.get(API_KEY_HEADER_NAME)
+    if api_key and api_key == API_KEY:
+        return "api_key"
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="User authentication required. Please log in.",
+    )
