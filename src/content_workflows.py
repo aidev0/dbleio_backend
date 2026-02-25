@@ -3092,6 +3092,10 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
             elif vid_type == "video":
                 video_desc += " — complete video"
 
+            persona_section = ""
+            if persona_context:
+                persona_section = "PERSONAS (use these as additional context for scoring):" + persona_context
+
             prompt = f"""You are an expert marketing analyst. Score how well this specific video would resonate with each demographic segment.
 
 BRAND: {brand_name}
@@ -3107,7 +3111,7 @@ Storyboards:
 {storyboard_summary if storyboard_summary else "No storyboards generated yet."}
 
 VIDEO BEING EVALUATED: {video_desc}
-{("PERSONAS (use these as additional context for scoring):\n" + persona_context + "\n") if persona_context else ""}
+{persona_section}
 DEMOGRAPHIC SEGMENTS TO SCORE:
 {combos_str}
 
