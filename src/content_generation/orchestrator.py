@@ -283,10 +283,17 @@ class ContentOrchestrator:
         if not stage_def:
             return {"error": f"Unknown stage: {stage_key}"}
 
-        self.state.update_node(stage_key, "completed", output_data=input_data)
+        # Merge input_data into existing output_data instead of replacing it,
+        # so that AI-generated results (storyboards, variations, predictions, etc.)
+        # are preserved when a human marks a stage as complete.
+        existing_node = db.content_workflow_nodes.find_one(
+            {"workflow_id": self.workflow_id, "stage_key": stage_key}
+        )
+        merged_output = {**(existing_node.get("output_data", {}) if existing_node else {}), **input_data}
+        self.state.update_node(stage_key, "completed", output_data=merged_output)
 
         state_data = WorkflowStateStore.get_state_data(self.workflow_id)
-        state_data.setdefault("stage_outputs", {})[stage_key] = input_data
+        state_data.setdefault("stage_outputs", {})[stage_key] = merged_output
         WorkflowStateStore.save(self.workflow_id, state_data)
 
         if stage_def.approval_required:
