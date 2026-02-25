@@ -54,8 +54,9 @@ class ChatMessageRequest(BaseModel):
 
 
 class GenerateConceptsRequest(BaseModel):
-    num: int = Field(ge=1, le=50)
-    tone: str
+    num: int = Field(default=3, ge=1, le=50)
+    tone: str = "engaging"
+    content_type: str = "reel"
 
 
 class GenerateStoryboardRequest(BaseModel):
@@ -70,6 +71,13 @@ class GenerateStoryboardImageRequest(BaseModel):
     target_type: str  # "character" | "scene"
     target_id: str
     image_model: Optional[str] = None
+
+
+class GenerateConceptImageRequest(BaseModel):
+    concept_index: int
+    image_model: Optional[str] = None
+    slide_index: Optional[int] = None  # for carousels
+    content_piece_key: Optional[str] = None  # to scope storage
 
 
 class GenerateVideoRequest(BaseModel):
@@ -130,6 +138,14 @@ def _refresh_media_urls(output_data: dict) -> dict:
                 if fresh:
                     scene["image_url"] = fresh
 
+    # Re-sign concept images
+    for img in output_data.get("images", []):
+        gs_uri = img.get("gs_uri")
+        if gs_uri:
+            fresh = get_fresh_signed_url(gs_uri)
+            if fresh:
+                img["image_url"] = fresh
+
     return output_data
 
 
@@ -141,7 +157,7 @@ def _node_helper(doc) -> dict:
     output_data = doc.get("output_data", {})
 
     # Re-sign GCS URLs for stages that contain media
-    if stage_key in ("video_generation", "storyboard") and output_data:
+    if stage_key in ("video_generation", "storyboard", "image_generation") and output_data:
         import copy
         output_data = _refresh_media_urls(copy.deepcopy(output_data))
 
@@ -427,6 +443,7 @@ STAGE_ORDER = [
 AVAILABLE_STAGES = {
     "strategy_assets", "scheduling", "concepts",
     "image_generation", "storyboard", "video_generation",
+    "simulation_testing",
 }
 
 
@@ -609,15 +626,45 @@ async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, req
 
         context_str = "\n".join(context_parts) if context_parts else "No additional context available."
 
-        system_prompt = f"""You are a creative content strategist. Generate content concepts based on the following context.
-
-{context_str}
-
-Return a JSON array of exactly {body.num} concepts with tone "{body.tone}". Each concept must have:
+        # Build output schema based on content_type
+        content_type = body.content_type or "reel"
+        if content_type == "reel":
+            schema_desc = """Each concept must have:
+- "title": a catchy concept title
+- "hook": the opening hook (1-2 sentences that grab attention)
+- "script": an array of 3-5 script bullet points (as a JSON array of strings)
+- "audio_cues": suggested background music/sound effects
+- "duration": suggested duration (e.g. "30s", "60s", "90s")"""
+        elif content_type == "carousel":
+            schema_desc = """Each concept must have:
+- "title": a catchy concept title
+- "slides": an array of 3-10 slide objects, each with "image_description" and "caption"
+- "messaging": an array of 2-3 key messaging points"""
+        elif content_type == "post":
+            schema_desc = """Each concept must have:
+- "title": a catchy concept title
+- "image_description": detailed description of the post image
+- "caption": the post caption text
+- "messaging": an array of 2-3 key messaging points"""
+        elif content_type == "story":
+            schema_desc = """Each concept must have:
+- "title": a catchy concept title
+- "frame_description": description of the story visual frame
+- "caption": overlay text for the story
+- "cta": call-to-action text (e.g. "Swipe up", "Link in bio")"""
+        else:
+            schema_desc = """Each concept must have:
 - "title": a catchy concept title
 - "hook": the opening hook (1-2 sentences)
 - "script": a script outline (3-5 bullet points)
-- "messaging": an array of 2-3 key messaging points
+- "messaging": an array of 2-3 key messaging points"""
+
+        system_prompt = f"""You are a creative content strategist. Generate {content_type} content concepts based on the following context.
+
+{context_str}
+
+Return a JSON array of exactly {body.num} concepts with tone "{body.tone}" for {content_type} format.
+{schema_desc}
 
 Return ONLY valid JSON: {{"concepts": [...]}}"""
 
@@ -659,9 +706,10 @@ Return ONLY valid JSON: {{"concepts": [...]}}"""
         else:
             result = {"concepts": []}
 
-        # Tag each concept with the tone
+        # Tag each concept with the tone and content_type
         for concept in result.get("concepts", []):
             concept["tone"] = body.tone
+            concept["content_type"] = content_type
 
         return result
     except HTTPException:
@@ -1321,6 +1369,302 @@ async def _generate_storyboard_image_background(
             state_data = WorkflowStateStore.get_state_data(workflow_id)
             state_data.setdefault("stage_outputs", {})["storyboard"] = output
             WorkflowStateStore.save(workflow_id, state_data)
+
+        task_manager.update_task(
+            task_id,
+            status=TaskStatus.COMPLETED,
+            progress=100,
+            message="Image generated successfully",
+            result={"image_url": signed_url, "gs_uri": gs_uri},
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        task_manager.update_task(
+            task_id,
+            status=TaskStatus.FAILED,
+            message=str(e),
+            error=str(e),
+        )
+
+
+# --- Concept Image Generation ---
+
+@router.post("/{workflow_id}/generate-concept-image")
+async def generate_concept_image(
+    workflow_id: str,
+    body: GenerateConceptImageRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Kick off async image generation for a concept (before storyboard)."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Load concepts from workflow config
+        config = workflow.get("config", {})
+        stage_settings = config.get("stage_settings", {})
+        piece_key = body.content_piece_key
+
+        concepts = []
+        if piece_key:
+            pieces = stage_settings.get("concepts", {}).get("pieces", {})
+            piece_data = pieces.get(piece_key, {})
+            concepts = piece_data.get("generated_concepts", [])
+
+        # Fallback: try node output
+        if not concepts:
+            concept_node = db.content_workflow_nodes.find_one({
+                "workflow_id": workflow_id,
+                "stage_key": "concepts",
+            })
+            if concept_node and concept_node.get("output_data"):
+                concepts = concept_node["output_data"].get("concepts", [])
+
+        if body.concept_index < 0 or body.concept_index >= len(concepts):
+            raise HTTPException(status_code=400, detail=f"Invalid concept_index {body.concept_index}. Available: 0-{len(concepts)-1}")
+
+        concept = concepts[body.concept_index]
+        content_type = concept.get("content_type", "")
+
+        # Extract image prompt based on content type
+        image_prompt = None
+        if content_type == "post":
+            image_prompt = concept.get("image_description")
+        elif content_type == "carousel":
+            slides = concept.get("slides", [])
+            if body.slide_index is not None:
+                if body.slide_index < 0 or body.slide_index >= len(slides):
+                    raise HTTPException(status_code=400, detail=f"Invalid slide_index {body.slide_index}. Available: 0-{len(slides)-1}")
+                image_prompt = slides[body.slide_index].get("image_description")
+            else:
+                raise HTTPException(status_code=400, detail="slide_index is required for carousel concepts")
+        elif content_type == "story":
+            image_prompt = concept.get("frame_description")
+        else:
+            # Fallback
+            image_prompt = concept.get("image_description") or concept.get("hook", "")
+
+        if not image_prompt:
+            raise HTTPException(status_code=400, detail="No image description found for this concept")
+
+        image_model = body.image_model or "google/nano-banana-pro"
+
+        # Create background task
+        from src.task_manager import task_manager
+        slide_suffix = body.slide_index if body.slide_index is not None else 0
+        task_id = f"concept_img_{workflow_id}_{body.concept_index}_{slide_suffix}"
+
+        task_manager.create_task(
+            task_id,
+            "concept_image_generation",
+            metadata={
+                "workflow_id": workflow_id,
+                "concept_index": body.concept_index,
+                "slide_index": body.slide_index,
+                "image_model": image_model,
+                "content_piece_key": piece_key,
+            }
+        )
+
+        background_tasks.add_task(
+            _generate_concept_image_background,
+            task_id,
+            workflow_id,
+            body.concept_index,
+            body.slide_index,
+            image_prompt,
+            image_model,
+            piece_key,
+        )
+
+        return {"task_id": task_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _generate_concept_image_background(
+    task_id: str,
+    workflow_id: str,
+    concept_index: int,
+    slide_index: Optional[int],
+    image_prompt: str,
+    image_model: str,
+    content_piece_key: Optional[str],
+):
+    """Background task: call Replicate API, upload to GCS, update node & config."""
+    import httpx
+    import asyncio
+    from src.task_manager import task_manager, TaskStatus
+
+    try:
+        task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=10, message="Starting image generation...")
+
+        REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+        if not REPLICATE_API_TOKEN:
+            raise Exception("REPLICATE_API_TOKEN not configured")
+
+        # Map model shorthand to Replicate model string
+        model_string = image_model
+        if "/" not in image_model:
+            model_map = {
+                "nano-banana": "google/nano-banana",
+                "nano-banana-pro": "google/nano-banana-pro",
+                "flux-schnell": "black-forest-labs/flux-schnell",
+                "flux-pro": "black-forest-labs/flux-1.1-pro",
+                "flux-dev": "black-forest-labs/flux-dev",
+                "sdxl": "stability-ai/sdxl",
+            }
+            model_string = model_map.get(image_model, f"google/{image_model}")
+
+        # Call Replicate API
+        async with httpx.AsyncClient(timeout=120) as http_client:
+            create_resp = await http_client.post(
+                f"https://api.replicate.com/v1/models/{model_string}/predictions",
+                headers={
+                    "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": {"prompt": image_prompt}},
+            )
+            if create_resp.status_code != 201:
+                raise Exception(f"Replicate API error: {create_resp.status_code} {create_resp.text}")
+
+            prediction = create_resp.json()
+            prediction_url = prediction.get("urls", {}).get("get")
+            if not prediction_url:
+                raise Exception("No prediction URL returned from Replicate")
+
+            task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=30, message="Generating image...")
+
+            # Poll for completion
+            image_url_remote = None
+            for _ in range(120):  # Max 4 minutes
+                await asyncio.sleep(2)
+                poll_resp = await http_client.get(
+                    prediction_url,
+                    headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                )
+                poll_data = poll_resp.json()
+                status = poll_data.get("status")
+
+                if status == "succeeded":
+                    output = poll_data.get("output")
+                    if isinstance(output, list) and len(output) > 0:
+                        image_url_remote = output[0]
+                    elif isinstance(output, str):
+                        image_url_remote = output
+                    else:
+                        raise Exception(f"Unexpected Replicate output format: {output}")
+                    break
+                elif status == "failed":
+                    error = poll_data.get("error", "Unknown error")
+                    raise Exception(f"Replicate prediction failed: {error}")
+            else:
+                raise Exception("Image generation timed out")
+
+            task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=60, message="Uploading to storage...")
+
+            # Download image
+            img_resp = await http_client.get(image_url_remote)
+            if img_resp.status_code != 200:
+                raise Exception(f"Failed to download image from Replicate: {img_resp.status_code}")
+            image_bytes = img_resp.content
+
+        # Upload to GCS
+        from google.cloud import storage as gcs_storage
+        from google.oauth2 import service_account
+
+        GCS_BUCKET = os.getenv('GCS_BUCKET', 'video-marketing-simulation')
+        service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+        if not service_account_json:
+            raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+
+        credentials_dict = json.loads(service_account_json)
+        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+        storage_client = gcs_storage.Client(credentials=credentials, project=credentials.project_id)
+        bucket = storage_client.bucket(GCS_BUCKET)
+
+        slide_suffix = slide_index if slide_index is not None else 0
+        blob_path = f"concepts/{workflow_id}/{concept_index}_{slide_suffix}.png"
+        blob = bucket.blob(blob_path)
+        blob.upload_from_string(image_bytes, content_type="image/png")
+
+        gs_uri = f"gs://{GCS_BUCKET}/{blob_path}"
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(days=7),
+            method="GET",
+            credentials=credentials,
+        )
+
+        task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=80, message="Saving result...")
+
+        image_record = {
+            "concept_index": concept_index,
+            "slide_index": slide_index,
+            "image_url": signed_url,
+            "gs_uri": gs_uri,
+            "image_model": image_model,
+        }
+
+        # Update image_generation node output_data
+        img_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "image_generation",
+        })
+        if img_node:
+            output = img_node.get("output_data", {})
+            images = output.get("images", [])
+            # Replace existing entry for same concept_index + slide_index, or append
+            replaced = False
+            for i, existing in enumerate(images):
+                if existing.get("concept_index") == concept_index and existing.get("slide_index") == slide_index:
+                    images[i] = image_record
+                    replaced = True
+                    break
+            if not replaced:
+                images.append(image_record)
+            output["images"] = images
+            db.content_workflow_nodes.update_one(
+                {"_id": img_node["_id"]},
+                {"$set": {"output_data": output, "updated_at": datetime.utcnow()}},
+            )
+
+        # Also store in workflow config stage_settings
+        if content_piece_key:
+            workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
+            if workflow:
+                config = workflow.get("config", {})
+                ss = config.get("stage_settings", {})
+                img_settings = ss.get("image_generation", {})
+                pieces = img_settings.get("pieces", {})
+                piece = pieces.get(content_piece_key, {})
+                gen_images = piece.get("generated_images", [])
+                # Replace or append
+                replaced = False
+                for i, existing in enumerate(gen_images):
+                    if existing.get("concept_index") == concept_index and existing.get("slide_index") == slide_index:
+                        gen_images[i] = image_record
+                        replaced = True
+                        break
+                if not replaced:
+                    gen_images.append(image_record)
+                piece["generated_images"] = gen_images
+                pieces[content_piece_key] = piece
+                img_settings["pieces"] = pieces
+                ss["image_generation"] = img_settings
+                config["stage_settings"] = ss
+                db.content_workflows.update_one(
+                    {"_id": ObjectId(workflow_id)},
+                    {"$set": {"config": config, "updated_at": datetime.utcnow()}},
+                )
 
         task_manager.update_task(
             task_id,
@@ -2353,6 +2697,214 @@ def _write_video_variations_to_node(workflow_id: str, task_id: str, videos: list
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         })
+
+
+# --- Simulation ---
+
+class RunSimulationRequest(BaseModel):
+    genders: List[str] = Field(default=["Male", "Female"])
+    ages: List[str] = Field(default=["18-24", "25-34"])
+    model_provider: str = "google"
+    model_name: str = "gemini-2.5-flash"
+    persona_ids: Optional[List[str]] = None
+
+
+@router.post("/{workflow_id}/simulate")
+async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: Request):
+    """Run LLM-based simulation scoring for gender × age demographic segments."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Gather context from workflow and related data
+        brand = db.brands.find_one({"_id": ObjectId(workflow["brand_id"])}) if workflow.get("brand_id") else None
+        brand_name = brand.get("name", "Unknown Brand") if brand else "Unknown Brand"
+        brand_description = brand.get("description", "") if brand else ""
+
+        campaign_id = (workflow.get("config") or {}).get("campaign_id")
+        campaign = db.campaigns.find_one({"_id": ObjectId(campaign_id)}) if campaign_id else None
+        campaign_name = campaign.get("name", "") if campaign else ""
+        campaign_goal = campaign.get("campaign_goal", "") if campaign else ""
+
+        # Get video/storyboard context from nodes
+        nodes = {n["stage_key"]: n for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
+        concepts_output = nodes.get("concepts", {}).get("output_data", {})
+        storyboard_output = nodes.get("storyboard", {}).get("output_data", {})
+        video_output = nodes.get("video_generation", {}).get("output_data", {})
+
+        concepts_summary = ""
+        for c in concepts_output.get("concepts", [])[:3]:
+            concepts_summary += f"- {c.get('title', 'Untitled')}: {c.get('hook', '')}\n"
+
+        storyboard_summary = ""
+        for sb in storyboard_output.get("storyboards", [])[:2]:
+            storyboard_summary += f"- Storyline: {sb.get('storyline', '')[:200]}\n"
+            storyboard_summary += f"  Scenes: {len(sb.get('scenes', []))} cuts\n"
+
+        video_count = len(video_output.get("variations", []))
+
+        # Fetch persona context if persona_ids provided
+        persona_context = ""
+        if body.persona_ids:
+            for pid in body.persona_ids:
+                try:
+                    persona = db.personas.find_one({"_id": ObjectId(pid)})
+                    if persona:
+                        p_name = persona.get("name", "Unknown")
+                        p_desc = persona.get("description", "")
+                        p_demos = persona.get("demographics", {})
+                        demo_parts = []
+                        for k, v in p_demos.items():
+                            if v and k not in ("custom_fields",):
+                                if isinstance(v, list) and len(v) > 0:
+                                    demo_parts.append(f"{k}: {', '.join(str(x) for x in v)}")
+                                elif isinstance(v, (str, int, float)) and v:
+                                    demo_parts.append(f"{k}: {v}")
+                        persona_context += f"\n- {p_name}: {p_desc}"
+                        if demo_parts:
+                            persona_context += f" ({'; '.join(demo_parts)})"
+                except Exception:
+                    pass
+
+        # Build combos list
+        combos = []
+        for g in body.genders:
+            for a in body.ages:
+                combos.append({"gender": g, "age": a})
+
+        combos_str = json.dumps(combos)
+
+        prompt = f"""You are an expert marketing analyst. Score how well this video content would resonate with each demographic segment.
+
+BRAND: {brand_name}
+{f"Brand Description: {brand_description}" if brand_description else ""}
+{f"Campaign: {campaign_name}" if campaign_name else ""}
+{f"Campaign Goal: {campaign_goal}" if campaign_goal else ""}
+
+CONTENT CONTEXT:
+Concepts:
+{concepts_summary if concepts_summary else "No concepts generated yet."}
+
+Storyboards:
+{storyboard_summary if storyboard_summary else "No storyboards generated yet."}
+
+Videos: {video_count} variations generated.
+{f"""
+PERSONAS (use these as additional context for scoring):
+{persona_context}
+""" if persona_context else ""}
+DEMOGRAPHIC SEGMENTS TO SCORE:
+{combos_str}
+
+For EACH segment, provide a score from 0-100 and a brief reasoning (1-2 sentences).
+
+Return ONLY a JSON object with this exact structure:
+{{"results": [
+  {{"gender": "...", "age": "...", "score": 0-100, "reasoning": "..."}},
+  ...
+]}}
+
+Score based on:
+- Content relevance to the demographic
+- Visual style and tone alignment
+- Platform engagement patterns for the age group
+- Messaging effectiveness for the gender/age combination
+"""
+
+        # Resolve provider from model name (same pattern as storyboard generation)
+        llm_model = body.model_name
+        provider = body.model_provider
+
+        # Auto-detect provider from model name if not explicitly set
+        if not provider:
+            if llm_model.startswith("gemini") or llm_model == "gemini-pro-3":
+                provider = "google"
+            elif llm_model.startswith("gpt") or llm_model.startswith("o1"):
+                provider = "openai"
+            elif llm_model.startswith("claude"):
+                provider = "anthropic"
+            else:
+                provider = "google"  # default
+
+        # Map frontend model names to actual API model names
+        model_map = {
+            "gemini-pro-3": "gemini-2.5-pro",
+            "claude-4.5-sonnet": "claude-sonnet-4.5",
+            "gpt-5.2": "gpt-4o",
+        }
+        mapped_model = model_map.get(llm_model, llm_model)
+
+        # Call LLM using existing evaluate functions
+        from src.ai_agent import evaluate_with_openai, evaluate_with_anthropic, evaluate_with_google
+
+        result = None
+        if provider == "openai":
+            result = evaluate_with_openai(prompt, mapped_model)
+        elif provider == "anthropic":
+            result = evaluate_with_anthropic(prompt, mapped_model)
+        elif provider == "google":
+            result = evaluate_with_google(prompt, mapped_model)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+        if not result:
+            raise HTTPException(status_code=500, detail="LLM returned no result")
+
+        # Extract results array
+        results = result.get("results", [])
+        if not results:
+            raise HTTPException(status_code=500, detail="LLM response missing results array")
+
+        # Ensure scores are integers 0-100
+        for r in results:
+            r["score"] = max(0, min(100, int(r.get("score", 0))))
+
+        # Save to simulation_testing node output_data
+        sim_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "simulation_testing",
+        })
+        output_data = {
+            "results": results,
+            "config": {
+                "genders": body.genders,
+                "ages": body.ages,
+                "model_provider": provider,
+                "model_name": llm_model,
+            },
+            "run_at": datetime.utcnow().isoformat(),
+        }
+        if sim_node:
+            db.content_workflow_nodes.update_one(
+                {"_id": sim_node["_id"]},
+                {"$set": {
+                    "output_data": output_data,
+                    "status": "completed",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        else:
+            # Determine stage_index
+            stage_index = STAGE_ORDER.index("simulation_testing") if "simulation_testing" in STAGE_ORDER else 7
+            db.content_workflow_nodes.insert_one({
+                "workflow_id": workflow_id,
+                "stage_key": "simulation_testing",
+                "stage_index": stage_index,
+                "stage_type": "agent",
+                "status": "completed",
+                "input_data": {},
+                "output_data": output_data,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+
+        return {"results": results}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Helpers ---
