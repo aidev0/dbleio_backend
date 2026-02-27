@@ -23,6 +23,35 @@ db = client[MONGODB_DB_NAME]
 
 router = APIRouter(prefix="/api/content/workflows", tags=["content-workflows"])
 
+# --- Collections: Contents Calendar & Feedback ---
+contents_calendar = db.contents_calendar
+fdms_feedbacks_col = db.fdms_feedbacks
+clients_feedbacks_col = db.clients_feedbacks
+
+# Indexes — contents_calendar
+contents_calendar.create_index([("workflow_id", 1), ("content_id", 1)], unique=True)
+contents_calendar.create_index([("brand_id", 1)])
+contents_calendar.create_index([("organization_id", 1)])
+contents_calendar.create_index([("date", 1)])
+
+# Indexes — fdms_feedbacks
+fdms_feedbacks_col.create_index(
+    [("user_id", 1), ("workflow_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
+    unique=True,
+    partialFilterExpression={"comment": None},
+)
+fdms_feedbacks_col.create_index([("workflow_id", 1), ("stage_key", 1), ("item_id", 1)])
+fdms_feedbacks_col.create_index([("content_id", 1)])
+
+# Indexes — clients_feedbacks
+clients_feedbacks_col.create_index(
+    [("user_id", 1), ("workflow_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
+    unique=True,
+    partialFilterExpression={"comment": None},
+)
+clients_feedbacks_col.create_index([("workflow_id", 1), ("stage_key", 1), ("item_id", 1)])
+clients_feedbacks_col.create_index([("content_id", 1)])
+
 
 # --- Models ---
 
@@ -57,12 +86,14 @@ class GenerateConceptsRequest(BaseModel):
     num: int = Field(default=3, ge=1, le=50)
     tone: str = "engaging"
     content_type: str = "reel"
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 class GenerateStoryboardRequest(BaseModel):
     concept_index: int
     llm_model: Optional[str] = None  # "gemini-pro-3" | "claude-sonnet" | etc.
     image_model: Optional[str] = None  # default image model for assets
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 class GenerateStoryboardImageRequest(BaseModel):
@@ -71,6 +102,7 @@ class GenerateStoryboardImageRequest(BaseModel):
     target_type: str  # "character" | "scene"
     target_id: str
     image_model: Optional[str] = None
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 class GenerateConceptImageRequest(BaseModel):
@@ -78,6 +110,7 @@ class GenerateConceptImageRequest(BaseModel):
     image_model: Optional[str] = None
     slide_index: Optional[int] = None  # for carousels
     content_piece_key: Optional[str] = None  # to scope storage
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 class GenerateVideoRequest(BaseModel):
@@ -88,6 +121,47 @@ class GenerateVideoRequest(BaseModel):
     resolution: Optional[str] = None  # 720p, 1080p, 4k
     temperature: Optional[float] = None
     custom_prompt: Optional[str] = None  # user-provided prompt template
+    content_id: Optional[str] = None  # WS2: content calendar item ID
+
+
+# --- WS1: Calendar Models ---
+
+class CalendarItemCreate(BaseModel):
+    content_id: str
+    platform: str
+    content_type: str
+    date: str  # YYYY-MM-DD
+    post_time: Optional[str] = None
+    frequency: Optional[str] = None
+    days: Optional[List[int]] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    title: Optional[str] = None
+    status: str = "scheduled"
+
+
+class CalendarItemUpdate(BaseModel):
+    platform: Optional[str] = None
+    content_type: Optional[str] = None
+    date: Optional[str] = None
+    post_time: Optional[str] = None
+    frequency: Optional[str] = None
+    days: Optional[List[int]] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    title: Optional[str] = None
+    status: Optional[str] = None
+
+
+# --- WS4: Feedback Models ---
+
+class FeedbackCreate(BaseModel):
+    content_id: Optional[str] = None
+    stage_key: str
+    item_type: str  # "concept" | "scene" | "character" | "video" | etc.
+    item_id: str  # stable identifier
+    reaction: Optional[str] = None  # "like" | "dislike" | None
+    comment: Optional[str] = None  # free-text
 
 
 # --- Helpers ---
@@ -971,9 +1045,75 @@ async def get_image_models(request: Request):
 
 # --- Storyboard Generation ---
 
+
+def _call_storyboard_llm(system_prompt: str, user_prompt: str, llm_model: str, workos_user_id: str, campaign_id: str, mode: str = "storyboard_generation") -> str:
+    """Call LLM for storyboard generation. Returns raw assistant text."""
+    from src.chat import save_llm_usage
+
+    if llm_model.startswith("gemini"):
+        import google.generativeai as genai
+        GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+        if not GOOGLE_API_KEY:
+            raise HTTPException(status_code=500, detail="Google API key not configured")
+        genai.configure(api_key=GOOGLE_API_KEY)
+        gemini_model_map = {"gemini-pro-3": "gemini-3-pro-preview", "gemini-flash-3": "gemini-3-flash-preview", "gemini-flash": "gemini-3-flash-preview", "gemini-pro": "gemini-3-pro-preview"}
+        gemini_model_id = gemini_model_map.get(llm_model, llm_model)
+        model = genai.GenerativeModel(gemini_model_id)
+        response = model.generate_content(
+            [{"role": "user", "parts": [{"text": system_prompt}]}, {"role": "model", "parts": [{"text": "Understood."}]}, {"role": "user", "parts": [{"text": user_prompt}]}],
+            generation_config=genai.types.GenerationConfig(max_output_tokens=4096, temperature=0.7),
+        )
+        assistant_text = response.text
+        um = getattr(response, 'usage_metadata', None)
+        save_llm_usage(user_id=workos_user_id, campaign_id=campaign_id, provider="google", model_name=gemini_model_id,
+                       input_tokens=um.prompt_token_count if um and hasattr(um, 'prompt_token_count') else 0,
+                       output_tokens=um.candidates_token_count if um and hasattr(um, 'candidates_token_count') else 0, mode=mode)
+
+    elif llm_model.startswith("gpt"):
+        from openai import OpenAI as OpenAIClient
+        OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        openai_model_map = {"gpt-4o": "gpt-4o", "gpt-5.2": "gpt-4o"}
+        openai_model_id = openai_model_map.get(llm_model, llm_model)
+        openai_client = OpenAIClient(api_key=OPENAI_API_KEY)
+        response = openai_client.chat.completions.create(model=openai_model_id, max_tokens=4096,
+                                                         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
+        assistant_text = response.choices[0].message.content
+        save_llm_usage(user_id=workos_user_id, campaign_id=campaign_id, provider="openai", model_name=openai_model_id,
+                       input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                       output_tokens=response.usage.completion_tokens if response.usage else 0, mode=mode)
+
+    else:
+        import anthropic
+        ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+        claude_model_map = {"claude-4.5-sonnet": "claude-sonnet-4-5-20250929", "claude-sonnet": "claude-sonnet-4-5-20250929", "claude-opus": "claude-opus-4-6"}
+        claude_model_id = claude_model_map.get(llm_model, "claude-sonnet-4-5-20250929")
+        anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = anthropic_client.messages.create(model=claude_model_id, max_tokens=4096, system=system_prompt,
+                                                    messages=[{"role": "user", "content": user_prompt}])
+        assistant_text = response.content[0].text
+        save_llm_usage(user_id=workos_user_id, campaign_id=campaign_id, provider="anthropic", model_name=claude_model_id,
+                       input_tokens=response.usage.input_tokens if response.usage else 0,
+                       output_tokens=response.usage.output_tokens if response.usage else 0, mode=mode)
+
+    return assistant_text
+
+
+def _parse_json_from_text(text: str) -> dict:
+    """Extract and parse the first JSON object from LLM text."""
+    import re
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if json_match:
+        return json.loads(json_match.group())
+    raise HTTPException(status_code=500, detail="Failed to parse JSON from AI response")
+
+
 @router.post("/{workflow_id}/generate-storyboard")
 async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest, request: Request):
-    """Generate a storyboard (storyline, characters, scenes) from a concept."""
+    """Generate a storyboard sequentially — characters + scene 1 first, then each subsequent scene with full prior context."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
@@ -989,7 +1129,6 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         config = workflow.get("config") or {}
         stage_settings = config.get("stage_settings", {})
         concepts_settings = stage_settings.get("concepts", {})
-        # Try all pieces to find concepts
         if not concepts_list:
             for piece_data in concepts_settings.get("pieces", {}).values():
                 piece_concepts = piece_data.get("generated_concepts", [])
@@ -1017,7 +1156,12 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         research_data = stage_settings.get("research", {})
         research_visual_context = _build_visual_style_context(research_data) if research_data else ""
 
-        system_prompt = f"""You are a creative director specializing in short-form video content. Generate a detailed storyboard for this concept.
+        llm_model = body.llm_model or "gemini-pro-3"
+        campaign_id = config.get("campaign_id")
+        image_model = body.image_model or "google/nano-banana-pro"
+
+        # ── Step 1: Generate storyline, characters, and scene 1 ──
+        step1_system = f"""You are a creative director specializing in short-form video content. Generate the foundation of a storyboard for this concept.
 
 {brand_context}
 
@@ -1025,16 +1169,17 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
 
 Concept: {json.dumps(concept)}
 
-Create a detailed storyboard that breaks this concept into filmable scenes. You must:
-1. First define all CHARACTERS with detailed, consistent visual descriptions. Each character's description must be specific enough to generate consistent AI images (age, ethnicity, build, hair, clothing, etc.)
-2. Then create SCENES that reference these characters. Each scene's image_prompt should incorporate the character's visual descriptions for consistency.
-3. Give each scene a shot type (close-up, medium, wide, over-shoulder, etc.) and duration hint.
-4. Use the visual style insights from research (colors, textures, lighting, shot types, objects) to inform your image_prompt descriptions so they match the proven aesthetic of top-performing content in this niche.
+You must:
+1. Write a 1-2 sentence storyline summarizing the narrative arc.
+2. Decide the total number of scenes (total_cuts).
+3. Define ALL characters with detailed, consistent visual descriptions specific enough for AI image generation (age, ethnicity, build, hair, clothing, etc.).
+4. Create ONLY SCENE 1 — the opening scene. Reference the characters by their IDs. The image_prompt must incorporate character visual descriptions for consistency.
+5. Use the visual style insights from research (colors, textures, lighting, shot types, objects) to inform your descriptions.
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON:
 {{
   "storyline": "A 1-2 sentence narrative summary",
-  "total_cuts": <number of scenes>,
+  "total_cuts": <total number of scenes you plan>,
   "characters": [
     {{
       "id": "char_0",
@@ -1048,7 +1193,14 @@ Return ONLY valid JSON in this exact format:
       "id": "scene_0",
       "scene_number": 1,
       "title": "Scene title",
-      "description": "What happens in this scene",
+      "description": "Detailed scene description — what happens, the mood, the setting",
+      "dialog": "Character dialog or voiceover script for this scene",
+      "lighting": "Lighting description, e.g. Natural golden hour sunlight, warm key light from left",
+      "time_of_day": "Time of day, e.g. late afternoon",
+      "camera_move": "Camera movement, e.g. Slow dolly-in from medium to close-up, slight tilt up",
+      "character_descriptions": [
+        {{"character_id": "char_0", "appearance_in_scene": "Specific appearance — wardrobe, expression, props"}}
+      ],
       "shot_type": "close-up",
       "duration_hint": "3s",
       "character_ids": ["char_0"],
@@ -1057,151 +1209,78 @@ Return ONLY valid JSON in this exact format:
   ]
 }}"""
 
-        llm_model = body.llm_model or "gemini-pro-3"
-        user_prompt = f"Generate a detailed storyboard for the concept: {concept_title}"
-        campaign_id = config.get("campaign_id")
+        step1_text = _call_storyboard_llm(step1_system, f"Generate the storyboard foundation and scene 1 for: {concept_title}", llm_model, workos_user_id, campaign_id)
+        storyboard_data = _parse_json_from_text(step1_text)
 
-        if llm_model.startswith("gemini"):
-            # Use Google Gemini
-            import google.generativeai as genai
-            GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-            if not GOOGLE_API_KEY:
-                raise HTTPException(status_code=500, detail="Google API key not configured")
-            genai.configure(api_key=GOOGLE_API_KEY)
+        characters = storyboard_data.get("characters", [])
+        scenes = storyboard_data.get("scenes", [])
+        total_cuts = storyboard_data.get("total_cuts", 1)
+        storyline = storyboard_data.get("storyline", "")
 
-            # Map model shorthand to actual Gemini model ID
-            gemini_model_map = {
-                "gemini-pro-3": "gemini-3-pro-preview",
-                "gemini-flash-3": "gemini-3-flash-preview",
-                "gemini-flash": "gemini-3-flash-preview",
-                "gemini-pro": "gemini-3-pro-preview",
-            }
-            gemini_model_id = gemini_model_map.get(llm_model, llm_model)
+        # ── Step 2..N: Generate remaining scenes sequentially ──
+        for scene_num in range(2, total_cuts + 1):
+            prev_scenes_json = json.dumps(scenes, indent=2)
+            chars_json = json.dumps(characters, indent=2)
 
-            model = genai.GenerativeModel(gemini_model_id)
-            gemini_messages = [
-                {"role": "user", "parts": [{"text": system_prompt}]},
-                {"role": "model", "parts": [{"text": "I understand. I will generate the storyboard as requested."}]},
-                {"role": "user", "parts": [{"text": user_prompt}]},
-            ]
-            response = model.generate_content(
-                gemini_messages,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=4096,
-                    temperature=0.7
-                )
-            )
-            assistant_text = response.text
-            input_tokens = getattr(response, 'usage_metadata', None)
-            input_tokens = input_tokens.prompt_token_count if input_tokens and hasattr(input_tokens, 'prompt_token_count') else 0
-            output_tokens = getattr(response, 'usage_metadata', None)
-            output_tokens = output_tokens.candidates_token_count if output_tokens and hasattr(output_tokens, 'candidates_token_count') else 0
+            step_n_system = f"""You are a creative director continuing a storyboard. Generate the NEXT scene only.
 
-            from src.chat import save_llm_usage
-            save_llm_usage(
-                user_id=workos_user_id,
-                campaign_id=campaign_id,
-                provider="google",
-                model_name=gemini_model_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                mode="storyboard_generation",
-            )
+{brand_context}
 
-        elif llm_model.startswith("gpt"):
-            # Use OpenAI
-            from openai import OpenAI as OpenAIClient
-            OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-            if not OPENAI_API_KEY:
-                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+{research_visual_context}
 
-            openai_model_map = {
-                "gpt-4o": "gpt-4o",
-                "gpt-5.2": "gpt-4o",
-            }
-            openai_model_id = openai_model_map.get(llm_model, llm_model)
+Concept: {json.dumps(concept)}
+Storyline: {storyline}
 
-            openai_client = OpenAIClient(api_key=OPENAI_API_KEY)
-            response = openai_client.chat.completions.create(
-                model=openai_model_id,
-                max_tokens=4096,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            assistant_text = response.choices[0].message.content
-            input_tokens = response.usage.prompt_tokens if response.usage else 0
-            output_tokens = response.usage.completion_tokens if response.usage else 0
+CHARACTERS (already defined — reference these by ID):
+{chars_json}
 
-            from src.chat import save_llm_usage
-            save_llm_usage(
-                user_id=workos_user_id,
-                campaign_id=campaign_id,
-                provider="openai",
-                model_name=openai_model_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                mode="storyboard_generation",
-            )
+COMPLETED SCENES (1 through {scene_num - 1}) — maintain narrative continuity, visual consistency, and pacing:
+{prev_scenes_json}
 
-        else:
-            # Default: Anthropic Claude
-            import anthropic
-            ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-            if not ANTHROPIC_API_KEY:
-                raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+Now generate SCENE {scene_num} of {total_cuts}. This scene must:
+- Continue naturally from the previous scene(s)
+- Reference the established characters by their IDs
+- Maintain visual and tonal consistency
+- Advance the narrative toward the storyline's conclusion
+- Use the visual style insights from research
 
-            claude_model_map = {
-                "claude-4.5-sonnet": "claude-sonnet-4-5-20250929",
-                "claude-sonnet": "claude-sonnet-4-5-20250929",
-                "claude-opus": "claude-opus-4-6",
-            }
-            claude_model_id = claude_model_map.get(llm_model, "claude-sonnet-4-5-20250929")
+Return ONLY valid JSON for a single scene:
+{{
+  "id": "scene_{scene_num - 1}",
+  "scene_number": {scene_num},
+  "title": "Scene title",
+  "description": "Detailed scene description — what happens, the mood, the setting",
+  "dialog": "Character dialog or voiceover script for this scene",
+  "lighting": "Lighting description",
+  "time_of_day": "Time of day",
+  "camera_move": "Camera movement description",
+  "character_descriptions": [
+    {{"character_id": "char_0", "appearance_in_scene": "Specific appearance — wardrobe, expression, props"}}
+  ],
+  "shot_type": "close-up",
+  "duration_hint": "3s",
+  "character_ids": ["char_0"],
+  "image_prompt": "Detailed image generation prompt incorporating character descriptions and visual continuity from previous scenes"
+}}"""
 
-            anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            response = anthropic_client.messages.create(
-                model=claude_model_id,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            assistant_text = response.content[0].text
-            input_tokens = response.usage.input_tokens if response.usage else 0
-            output_tokens = response.usage.output_tokens if response.usage else 0
+            scene_text = _call_storyboard_llm(step_n_system, f"Generate scene {scene_num} of {total_cuts}.", llm_model, workos_user_id, campaign_id)
+            scene_data = _parse_json_from_text(scene_text)
+            # Ensure correct scene_number and id
+            scene_data["scene_number"] = scene_num
+            scene_data["id"] = scene_data.get("id", f"scene_{scene_num - 1}")
+            scenes.append(scene_data)
 
-            from src.chat import save_llm_usage
-            save_llm_usage(
-                user_id=workos_user_id,
-                campaign_id=campaign_id,
-                provider="anthropic",
-                model_name=claude_model_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                mode="storyboard_generation",
-            )
-
-        # Parse JSON from response
-        import re
-        json_match = re.search(r'\{[\s\S]*\}', assistant_text)
-        if json_match:
-            storyboard_data = json.loads(json_match.group())
-        else:
-            raise HTTPException(status_code=500, detail="Failed to parse storyboard from AI response")
-
-        # Add metadata to each character/scene
-        image_model = body.image_model or "google/nano-banana-pro"
-        for char in storyboard_data.get("characters", []):
+        # ── Add metadata to characters and scenes ──
+        for char in characters:
             char["image_url"] = None
             char["gs_uri"] = None
             char["image_model"] = image_model
-        for scene in storyboard_data.get("scenes", []):
+        for scene in scenes:
             scene["image_url"] = None
             scene["gs_uri"] = None
             scene["image_model"] = image_model
 
         # Build the storyboard entry
-        # Determine variation_index for this concept
         storyboard_node = db.content_workflow_nodes.find_one({
             "workflow_id": workflow_id,
             "stage_key": "storyboard",
@@ -1209,7 +1288,6 @@ Return ONLY valid JSON in this exact format:
         existing_output = storyboard_node.get("output_data", {}) if storyboard_node else {}
         existing_storyboards = existing_output.get("storyboards", [])
 
-        # Count existing variations for this concept to assign next variation_index
         existing_for_concept = [sb for sb in existing_storyboards if sb.get("concept_index") == body.concept_index]
         variation_index = len(existing_for_concept)
 
@@ -1217,14 +1295,13 @@ Return ONLY valid JSON in this exact format:
             "concept_index": body.concept_index,
             "variation_index": variation_index,
             "concept_title": concept_title,
-            "storyline": storyboard_data.get("storyline", ""),
-            "total_cuts": storyboard_data.get("total_cuts", len(storyboard_data.get("scenes", []))),
-            "characters": storyboard_data.get("characters", []),
-            "scenes": storyboard_data.get("scenes", []),
+            "storyline": storyline,
+            "total_cuts": total_cuts,
+            "characters": characters,
+            "scenes": scenes,
             "status": "storyline_ready",
         }
 
-        # Always append as a new variation
         existing_storyboards.append(storyboard_entry)
 
         output_data = {
@@ -1257,6 +1334,11 @@ class UpdateSceneRequest(BaseModel):
     shot_type: Optional[str] = None
     duration_hint: Optional[str] = None
     image_prompt: Optional[str] = None
+    dialog: Optional[str] = None  # WS3: character dialog/voiceover
+    lighting: Optional[str] = None  # WS3: lighting description
+    time_of_day: Optional[str] = None  # WS3: time of day
+    camera_move: Optional[str] = None  # WS3: camera movement
+    character_descriptions: Optional[List[dict]] = None  # WS3: per-scene character appearance
 
 
 @router.patch("/{workflow_id}/storyboard-scene")
@@ -1307,6 +1389,17 @@ async def update_storyboard_scene(
             scene["duration_hint"] = body.duration_hint
         if body.image_prompt is not None:
             scene["image_prompt"] = body.image_prompt
+        # WS3: enhanced storyboard fields
+        if body.dialog is not None:
+            scene["dialog"] = body.dialog
+        if body.lighting is not None:
+            scene["lighting"] = body.lighting
+        if body.time_of_day is not None:
+            scene["time_of_day"] = body.time_of_day
+        if body.camera_move is not None:
+            scene["camera_move"] = body.camera_move
+        if body.character_descriptions is not None:
+            scene["character_descriptions"] = body.character_descriptions
 
         db.content_workflow_nodes.update_one(
             {"_id": storyboard_node["_id"]},
@@ -1317,6 +1410,49 @@ async def update_storyboard_scene(
         )
 
         return {"ok": True, "scene": scene}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}/storyboard/{storyboard_index}")
+async def delete_storyboard(workflow_id: str, storyboard_index: int, request: Request):
+    """Delete a storyboard variation by its index."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if not storyboard_node or not storyboard_node.get("output_data"):
+            raise HTTPException(status_code=400, detail="No storyboard found.")
+
+        output_data = storyboard_node["output_data"]
+        storyboards = output_data.get("storyboards", [])
+
+        if storyboard_index < 0 or storyboard_index >= len(storyboards):
+            raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {storyboard_index}")
+
+        storyboards.pop(storyboard_index)
+        output_data["storyboards"] = storyboards
+
+        db.content_workflow_nodes.update_one(
+            {"_id": storyboard_node["_id"]},
+            {"$set": {"output_data": output_data, "updated_at": datetime.utcnow()}},
+        )
+
+        # Update WorkflowStateStore
+        from src.content_generation.state import WorkflowStateStore
+        state_data = WorkflowStateStore.get_state_data(workflow_id)
+        state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
+        WorkflowStateStore.save(workflow_id, state_data)
+
+        return {"ok": True, "remaining": len(storyboards)}
 
     except HTTPException:
         raise
@@ -2003,10 +2139,11 @@ async def generate_video(
         # Build initial per-set tracking dict
         sets_tracking = {str(i): {"status": "processing", "stitched_url": None} for i in range(body.count)}
 
-        # Store the video generation job
+        # Store the video generation job (WS7: includes content_id)
         job = {
             "task_id": task_id,
             "workflow_id": workflow_id,
+            "content_id": body.content_id,  # WS2/WS7
             "storyboard_index": body.storyboard_index,
             "model": body.model,
             "count": body.count,
@@ -2370,6 +2507,54 @@ async def delete_video_job(workflow_id: str, task_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _generate_scene_continuity(completed_scenes: list, scene: dict, characters: list) -> str:
+    """WS6: Build continuity context from previously completed scenes."""
+    if not completed_scenes:
+        return ""
+    lines = ["CONTINUITY CONTEXT — Previous scenes in this video:"]
+    for cs in completed_scenes:
+        lines.append(f"  Scene {cs['scene_number']}: {cs['title']}")
+        lines.append(f"    Description: {cs['description']}")
+        if cs.get("visual_summary"):
+            lines.append(f"    Visual summary: {cs['visual_summary']}")
+        if cs.get("final_frame_description"):
+            lines.append(f"    Final frame: {cs['final_frame_description']}")
+    continuity_chars = set()
+    for cs in completed_scenes:
+        continuity_chars.update(cs.get("characters_shown", []))
+    char_details = [c for c in characters if c.get("id") in continuity_chars]
+    if char_details:
+        lines.append(f"  Characters established: {', '.join(c.get('name', c.get('id', '')) for c in char_details)}")
+    lines.append("\nIMPORTANT: Maintain visual continuity with previous scenes — same characters, same wardrobe, same lighting style, same setting details. The opening frame of this scene should visually connect to the final frame of the previous scene.")
+    return "\n".join(lines)
+
+
+def _derive_visual_summary(scene: dict, characters: list) -> dict:
+    """WS6: Derive visual_summary and final_frame_description from scene data (prompt-based, no frame extraction)."""
+    scene_chars = [c for c in characters if c.get("id") in scene.get("character_ids", [])]
+    char_names = [c.get("name", c.get("id", "")) for c in scene_chars]
+    char_desc_parts = [f"{c.get('name', '')}: {c.get('description', '')}" for c in scene_chars]
+
+    visual_summary = f"Scene: {scene.get('title', '')}. {scene.get('description', '')}."
+    if scene.get("shot_type"):
+        visual_summary += f" Shot: {scene['shot_type']}."
+    if scene.get("lighting"):
+        visual_summary += f" Lighting: {scene['lighting']}."
+    if char_desc_parts:
+        visual_summary += f" Characters: {'; '.join(char_desc_parts[:3])}."
+
+    final_frame = f"{scene.get('shot_type', 'Medium shot')} of "
+    if char_names:
+        final_frame += f"{', '.join(char_names)}"
+    else:
+        final_frame += "the scene"
+    if scene.get("lighting"):
+        final_frame += f", {scene['lighting']}"
+    final_frame += f". End of: {scene.get('description', '')[:100]}"
+
+    return {"visual_summary": visual_summary, "final_frame_description": final_frame}
+
+
 async def _run_video_generation(
     workflow_id: str,
     task_id: str,
@@ -2381,7 +2566,7 @@ async def _run_video_generation(
     temperature: float | None,
     custom_prompt: str | None = None,
 ):
-    """Background task: submit video generation jobs to external APIs (non-blocking)."""
+    """Background task: generate videos SEQUENTIALLY one scene at a time (WS6)."""
     import httpx
     import asyncio
 
@@ -2413,20 +2598,26 @@ async def _run_video_generation(
         else:
             provider_str = "replicate"
 
-        GOOGLE_BATCH_SIZE = 3
-        GOOGLE_POLL_INTERVAL = 10  # seconds between poll checks
+        POLL_INTERVAL = 10  # seconds between poll checks
 
         async with httpx.AsyncClient(timeout=60) as http:
             for set_idx in range(count):
-                # Build all scene entries first
-                scene_entries = []
+                # WS6: Scene state object for sequential continuity
+                scene_state = {
+                    "completed_scenes": [],
+                    "continuity_notes": "",
+                }
+
+                # Process scenes SEQUENTIALLY — one at a time
                 for j, scene in enumerate(scenes):
                     scene_chars = [c for c in characters if c.get("id") in scene.get("character_ids", [])]
                     char_desc = ", ".join([f"{c['name']}: {c.get('description', '')}" for c in scene_chars])
                     duration_hint = scene.get("duration_hint", "5s")
 
+                    # WS6: Build continuity context from completed scenes
+                    continuity_ctx = _generate_scene_continuity(scene_state["completed_scenes"], scene, characters)
+
                     if custom_prompt:
-                        # Interpolate user-provided template with scene variables
                         scene_prompt = custom_prompt.replace("{storyline}", storyline)
                         scene_prompt = scene_prompt.replace("{scene_number}", str(scene.get("scene_number", j + 1)))
                         scene_prompt = scene_prompt.replace("{title}", scene.get("title", ""))
@@ -2434,17 +2625,26 @@ async def _run_video_generation(
                         scene_prompt = scene_prompt.replace("{characters}", char_desc)
                         scene_prompt = scene_prompt.replace("{shot_type}", scene.get("shot_type", ""))
                         scene_prompt = scene_prompt.replace("{duration_hint}", duration_hint)
+                        if continuity_ctx:
+                            scene_prompt = continuity_ctx + "\n\n" + scene_prompt
                     else:
                         scene_prompt = f"Storyline context: {storyline}\n\n"
-                        scene_prompt += f"Generate ONLY this specific scene as a single video clip:\n"
-                        scene_prompt += f"Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
+                        if continuity_ctx:
+                            scene_prompt += continuity_ctx + "\n\n"
+                        scene_prompt += f"Now generate Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
+                        if scene.get("dialog"):
+                            scene_prompt += f" Dialog/voiceover: {scene['dialog']}."
+                        if scene.get("lighting"):
+                            scene_prompt += f" Lighting: {scene['lighting']}."
+                        if scene.get("camera_move"):
+                            scene_prompt += f" Camera: {scene['camera_move']}."
                         if char_desc:
                             scene_prompt += f" Characters: {char_desc}."
                         if scene.get("shot_type"):
                             scene_prompt += f" Shot type: {scene['shot_type']}."
                         scene_prompt += f"\n\nIMPORTANT: This video clip MUST be exactly {duration_hint} long."
 
-                    scene_entries.append({
+                    entry = {
                         "index": global_idx + j,
                         "set_index": set_idx,
                         "scene_index": j,
@@ -2456,79 +2656,90 @@ async def _run_video_generation(
                         "video_url": None,
                         "external_id": None,
                         "provider": provider_str,
-                    })
+                    }
 
-                if is_google_direct:
-                    # Submit in batches, wait for each batch to complete before next
-                    for batch_start in range(0, len(scene_entries), GOOGLE_BATCH_SIZE):
-                        batch = scene_entries[batch_start:batch_start + GOOGLE_BATCH_SIZE]
+                    # Submit this single scene
+                    try:
+                        if is_google_direct:
+                            external_id = await _submit_google_veo(http, entry["prompt"], model_cfg, resolution, output_format)
+                        elif is_openai_direct:
+                            external_id = await _submit_openai_sora(entry["prompt"], model_cfg, entry["duration_hint"], output_format)
+                        else:
+                            slug = getattr(model_cfg, "model_string", model) if model_cfg else model
+                            external_id = await _submit_replicate(http, entry["prompt"], slug, resolution)
+                        entry["external_id"] = external_id
+                    except Exception as submit_err:
+                        entry["status"] = "failed"
+                        entry["error"] = str(submit_err)
 
-                        # Submit this batch
-                        for entry in batch:
-                            try:
-                                external_id = await _submit_google_veo(http, entry["prompt"], model_cfg, resolution, output_format)
-                                entry["external_id"] = external_id
-                            except Exception as submit_err:
-                                entry["status"] = "failed"
-                                entry["error"] = str(submit_err)
-                            await asyncio.sleep(2)  # small gap between submissions within batch
+                    videos.append(entry)
 
-                        # Save progress so UI can see submitted scenes
-                        videos.extend(batch)
-                        db.video_generation_jobs.update_one(
-                            {"task_id": task_id},
-                            {"$set": {"videos": videos, "updated_at": datetime.utcnow()}},
-                        )
+                    # Save progress so UI can see submitted scene
+                    db.video_generation_jobs.update_one(
+                        {"task_id": task_id},
+                        {"$set": {"videos": videos, "scene_state": scene_state, "updated_at": datetime.utcnow()}},
+                    )
 
-                        # Wait for this batch to complete before submitting next
-                        if batch_start + GOOGLE_BATCH_SIZE < len(scene_entries):
-                            pending_ids = [e["external_id"] for e in batch if e.get("external_id")]
-                            for _ in range(60):  # max ~10 min wait per batch
-                                await asyncio.sleep(GOOGLE_POLL_INTERVAL)
-                                all_done = True
-                                for ext_id in pending_ids:
-                                    try:
-                                        GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-                                        api_base = "https://generativelanguage.googleapis.com/v1beta"
-                                        poll_resp = await http.get(
-                                            f"{api_base}/{ext_id}",
-                                            headers={"x-goog-api-key": GOOGLE_API_KEY},
-                                        )
-                                        if poll_resp.status_code == 200:
-                                            op = poll_resp.json()
-                                            if not op.get("done", False):
-                                                all_done = False
-                                                break
-                                    except Exception:
-                                        all_done = False
-                                        break
-                                if all_done:
-                                    break
-                else:
-                    # OpenAI / Replicate: submit all with small delays
-                    for entry in scene_entries:
-                        try:
-                            if is_openai_direct:
-                                external_id = await _submit_openai_sora(entry["prompt"], model_cfg, entry["duration_hint"], output_format)
-                            else:
-                                slug = getattr(model_cfg, "model_string", model) if model_cfg else model
-                                external_id = await _submit_replicate(http, entry["prompt"], slug, resolution)
-                            entry["external_id"] = external_id
-                        except Exception as submit_err:
-                            entry["status"] = "failed"
-                            entry["error"] = str(submit_err)
-                        if is_openai_direct:
+                    # WS6: Wait for this scene to complete before starting the next
+                    if entry.get("external_id") and entry["status"] != "failed":
+                        if is_google_direct:
+                            for _ in range(120):  # max ~20 min wait per scene
+                                await asyncio.sleep(POLL_INTERVAL)
+                                try:
+                                    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+                                    api_base = "https://generativelanguage.googleapis.com/v1beta"
+                                    poll_resp = await http.get(
+                                        f"{api_base}/{entry['external_id']}",
+                                        headers={"x-goog-api-key": GOOGLE_API_KEY},
+                                    )
+                                    if poll_resp.status_code == 200:
+                                        op = poll_resp.json()
+                                        if op.get("done", False):
+                                            break
+                                except Exception:
+                                    pass
+                        elif is_openai_direct:
+                            # OpenAI Sora — wait for completion
                             await asyncio.sleep(2)
-                    videos.extend(scene_entries)
+                        else:
+                            # Replicate — small delay
+                            await asyncio.sleep(2)
 
-                global_idx += len(scene_entries)
+                    # WS6: After scene completes, derive continuity info and add to scene_state
+                    summaries = _derive_visual_summary(scene, characters)
+                    completed_scene_info = {
+                        "scene_number": scene.get("scene_number", j + 1),
+                        "title": scene.get("title", ""),
+                        "description": scene.get("description", ""),
+                        "visual_summary": summaries["visual_summary"],
+                        "final_frame_description": summaries["final_frame_description"],
+                        "duration": duration_hint,
+                        "characters_shown": scene.get("character_ids", []),
+                    }
+                    scene_state["completed_scenes"].append(completed_scene_info)
 
-        # All per-scene jobs submitted — mark as processing so the status endpoint will poll
+                    # Update continuity notes
+                    all_chars_shown = set()
+                    for cs in scene_state["completed_scenes"]:
+                        all_chars_shown.update(cs.get("characters_shown", []))
+                    char_names = [c.get("name", c.get("id", "")) for c in characters if c.get("id") in all_chars_shown]
+                    scene_state["continuity_notes"] = f"Maintain: characters ({', '.join(char_names)}), established visual style and setting"
+
+                    # Save updated scene_state
+                    db.video_generation_jobs.update_one(
+                        {"task_id": task_id},
+                        {"$set": {"videos": videos, "scene_state": scene_state, "updated_at": datetime.utcnow()}},
+                    )
+
+                global_idx += len(scenes)
+
+        # All scenes submitted sequentially — mark as processing for status endpoint polling
         db.video_generation_jobs.update_one(
             {"task_id": task_id},
             {"$set": {
                 "status": "processing",
                 "videos": videos,
+                "scene_state": scene_state,
                 "updated_at": datetime.utcnow(),
             }},
         )
@@ -2980,6 +3191,7 @@ class RunSimulationRequest(BaseModel):
     model_name: str = "gemini-2.5-flash"
     persona_ids: Optional[List[str]] = None
     video_ids: Optional[List[str]] = None  # specific video variation IDs; None = all
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 @router.post("/{workflow_id}/simulate")
@@ -3262,6 +3474,7 @@ def _compute_research_benchmarks(config: dict) -> dict:
 class PredictRequest(BaseModel):
     model_name: str = "gemini-pro-3"
     video_ids: Optional[List[str]] = None
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 @router.post("/{workflow_id}/predict")
@@ -3461,6 +3674,7 @@ Guidelines:
 class RankRequest(BaseModel):
     simulation_weight: float = Field(default=0.4, ge=0, le=1)
     prediction_weight: float = Field(default=0.6, ge=0, le=1)
+    content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
 @router.post("/{workflow_id}/rank")
@@ -3591,6 +3805,452 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- WS1: Contents Calendar CRUD ---
+
+
+def _calendar_helper(doc) -> dict:
+    """Serialize a contents_calendar MongoDB doc."""
+    if not doc:
+        return {}
+    return {
+        "_id": str(doc["_id"]),
+        "content_id": doc.get("content_id"),
+        "workflow_id": doc.get("workflow_id"),
+        "brand_id": doc.get("brand_id"),
+        "organization_id": doc.get("organization_id"),
+        "platform": doc.get("platform"),
+        "content_type": doc.get("content_type"),
+        "date": doc.get("date"),
+        "post_time": doc.get("post_time"),
+        "frequency": doc.get("frequency"),
+        "days": doc.get("days"),
+        "start_date": doc.get("start_date"),
+        "end_date": doc.get("end_date"),
+        "title": doc.get("title"),
+        "status": doc.get("status", "scheduled"),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@router.post("/{workflow_id}/calendar", status_code=201)
+async def create_calendar_item(workflow_id: str, body: CalendarItemCreate, request: Request):
+    """Create a calendar item for a workflow."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        doc = {
+            "content_id": body.content_id,
+            "workflow_id": workflow_id,
+            "brand_id": workflow.get("brand_id"),
+            "organization_id": workflow.get("organization_id"),
+            "platform": body.platform,
+            "content_type": body.content_type,
+            "date": body.date,
+            "post_time": body.post_time,
+            "frequency": body.frequency,
+            "days": body.days,
+            "start_date": body.start_date,
+            "end_date": body.end_date,
+            "title": body.title,
+            "status": body.status,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        result = contents_calendar.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return _calendar_helper(doc)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/calendar")
+async def list_calendar_items(workflow_id: str, request: Request):
+    """List all calendar items for a workflow."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        items = contents_calendar.find({"workflow_id": workflow_id}).sort("date", 1)
+        return [_calendar_helper(doc) for doc in items]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/{workflow_id}/calendar/{content_id}")
+async def update_calendar_item(workflow_id: str, content_id: str, body: CalendarItemUpdate, request: Request):
+    """Update a calendar item."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        updates = {k: v for k, v in body.dict(exclude_unset=True).items() if v is not None}
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        updates["updated_at"] = datetime.utcnow()
+        result = contents_calendar.find_one_and_update(
+            {"workflow_id": workflow_id, "content_id": content_id},
+            {"$set": updates},
+            return_document=True,
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Calendar item not found")
+        return _calendar_helper(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}/calendar/{content_id}")
+async def delete_calendar_item(workflow_id: str, content_id: str, request: Request):
+    """Delete a calendar item."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        result = contents_calendar.delete_one({"workflow_id": workflow_id, "content_id": content_id})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Calendar item not found")
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{workflow_id}/calendar/migrate")
+async def migrate_calendar(workflow_id: str, request: Request):
+    """One-time migration: read content_items from workflow config and upsert into contents_calendar."""
+    try:
+        from src.auth import require_user_id
+        import uuid as _uuid
+        workos_user_id = require_user_id(request)
+        workflow = _verify_workflow_access(workflow_id, workos_user_id)
+
+        config = workflow.get("config") or {}
+        stage_settings = config.get("stage_settings", {})
+        scheduling = stage_settings.get("scheduling", {})
+        content_items = scheduling.get("content_items", [])
+
+        if not content_items:
+            return {"migrated": 0, "message": "No content_items found in stage_settings"}
+
+        migrated = 0
+        for item in content_items:
+            cid = item.get("content_id") or str(_uuid.uuid4())
+            existing = contents_calendar.find_one({"workflow_id": workflow_id, "content_id": cid})
+            if existing:
+                continue
+            doc = {
+                "content_id": cid,
+                "workflow_id": workflow_id,
+                "brand_id": workflow.get("brand_id"),
+                "organization_id": workflow.get("organization_id"),
+                "platform": item.get("platform", ""),
+                "content_type": item.get("content_type", ""),
+                "date": item.get("date", ""),
+                "post_time": item.get("post_time"),
+                "frequency": item.get("frequency"),
+                "days": item.get("days"),
+                "start_date": item.get("start_date"),
+                "end_date": item.get("end_date"),
+                "title": item.get("title"),
+                "status": item.get("status", "scheduled"),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            contents_calendar.insert_one(doc)
+            migrated += 1
+
+        return {"migrated": migrated, "total_items": len(content_items)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- WS4: Feedback Endpoints ---
+
+
+def _feedback_helper(doc) -> dict:
+    """Serialize a feedback MongoDB doc."""
+    if not doc:
+        return {}
+    return {
+        "_id": str(doc["_id"]),
+        "workflow_id": doc.get("workflow_id"),
+        "content_id": doc.get("content_id"),
+        "stage_key": doc.get("stage_key"),
+        "item_type": doc.get("item_type"),
+        "item_id": doc.get("item_id"),
+        "user_id": doc.get("user_id"),
+        "user_name": doc.get("user_name"),
+        "reaction": doc.get("reaction"),
+        "comment": doc.get("comment"),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+def _get_feedback_collection(workos_user_id: str):
+    """Route to clients_feedbacks for client users, fdms_feedbacks for others."""
+    user = db.users.find_one({"workos_user_id": workos_user_id})
+    if user and "client" in (user.get("roles") or []):
+        return clients_feedbacks_col
+    return fdms_feedbacks_col
+
+
+@router.post("/{workflow_id}/feedback", status_code=201)
+async def submit_feedback(workflow_id: str, body: FeedbackCreate, request: Request):
+    """Submit feedback (reaction and/or comment) on a pipeline item."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        col = _get_feedback_collection(workos_user_id)
+
+        # Get user name for display
+        user = db.users.find_one({"workos_user_id": workos_user_id})
+        user_name = ""
+        if user:
+            user_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get("email", "")
+
+        now = datetime.utcnow()
+
+        # Case 1: Reaction (like/dislike) — one per user per item, toggle behavior
+        if body.reaction and not body.comment:
+            existing = col.find_one({
+                "user_id": workos_user_id,
+                "workflow_id": workflow_id,
+                "stage_key": body.stage_key,
+                "item_id": body.item_id,
+                "comment": None,
+            })
+            if existing:
+                if existing.get("reaction") == body.reaction:
+                    # Toggle off — remove reaction
+                    col.delete_one({"_id": existing["_id"]})
+                    return {"ok": True, "action": "removed", "reaction": body.reaction}
+                else:
+                    # Change reaction
+                    col.update_one(
+                        {"_id": existing["_id"]},
+                        {"$set": {"reaction": body.reaction, "updated_at": now}},
+                    )
+                    existing["reaction"] = body.reaction
+                    existing["updated_at"] = now
+                    return _feedback_helper(existing)
+            else:
+                doc = {
+                    "workflow_id": workflow_id,
+                    "content_id": body.content_id,
+                    "stage_key": body.stage_key,
+                    "item_type": body.item_type,
+                    "item_id": body.item_id,
+                    "user_id": workos_user_id,
+                    "user_name": user_name,
+                    "reaction": body.reaction,
+                    "comment": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                result = col.insert_one(doc)
+                doc["_id"] = result.inserted_id
+                return _feedback_helper(doc)
+
+        # Case 2: Comment (with or without reaction)
+        if body.comment:
+            doc = {
+                "workflow_id": workflow_id,
+                "content_id": body.content_id,
+                "stage_key": body.stage_key,
+                "item_type": body.item_type,
+                "item_id": body.item_id,
+                "user_id": workos_user_id,
+                "user_name": user_name,
+                "reaction": body.reaction,
+                "comment": body.comment,
+                "created_at": now,
+                "updated_at": now,
+            }
+            result = col.insert_one(doc)
+            doc["_id"] = result.inserted_id
+            return _feedback_helper(doc)
+
+        raise HTTPException(status_code=400, detail="Must provide reaction and/or comment")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/feedback")
+async def get_item_feedback(
+    workflow_id: str,
+    request: Request,
+    stage_key: str = "",
+    item_id: str = "",
+):
+    """Get all feedback for a specific item (from both collections)."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        query = {"workflow_id": workflow_id}
+        if stage_key:
+            query["stage_key"] = stage_key
+        if item_id:
+            query["item_id"] = item_id
+
+        results = []
+        for doc in fdms_feedbacks_col.find(query).sort("created_at", 1):
+            fb = _feedback_helper(doc)
+            fb["source"] = "fdm"
+            results.append(fb)
+        for doc in clients_feedbacks_col.find(query).sort("created_at", 1):
+            fb = _feedback_helper(doc)
+            fb["source"] = "client"
+            results.append(fb)
+
+        return results
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{workflow_id}/feedback/summary")
+async def get_feedback_summary(
+    workflow_id: str,
+    request: Request,
+    stage_key: str = "",
+):
+    """Get aggregated feedback counts per item for a stage."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        query = {"workflow_id": workflow_id}
+        if stage_key:
+            query["stage_key"] = stage_key
+
+        summary = {}  # item_id -> { likes, dislikes, comments }
+
+        for col in [fdms_feedbacks_col, clients_feedbacks_col]:
+            for doc in col.find(query):
+                iid = doc.get("item_id", "")
+                if iid not in summary:
+                    summary[iid] = {"item_id": iid, "likes": 0, "dislikes": 0, "comments": 0}
+                if doc.get("reaction") == "like":
+                    summary[iid]["likes"] += 1
+                elif doc.get("reaction") == "dislike":
+                    summary[iid]["dislikes"] += 1
+                if doc.get("comment"):
+                    summary[iid]["comments"] += 1
+
+        return list(summary.values())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{workflow_id}/feedback/{feedback_id}")
+async def delete_feedback(workflow_id: str, feedback_id: str, request: Request):
+    """Delete own feedback. Returns 403 if not the author."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        # Try both collections
+        for col in [fdms_feedbacks_col, clients_feedbacks_col]:
+            doc = col.find_one({"_id": ObjectId(feedback_id), "workflow_id": workflow_id})
+            if doc:
+                if doc.get("user_id") != workos_user_id:
+                    raise HTTPException(status_code=403, detail="Can only delete your own feedback")
+                col.delete_one({"_id": doc["_id"]})
+                return {"ok": True}
+
+        raise HTTPException(status_code=404, detail="Feedback not found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- WS5: Feedback Context Builder ---
+
+
+def _build_feedback_context(workflow_id: str, stage_key: str, item_id: str) -> str:
+    """Query both feedback collections and build structured context for LLM regeneration."""
+    query = {"workflow_id": workflow_id, "stage_key": stage_key, "item_id": item_id}
+
+    all_feedback = []
+    for doc in fdms_feedbacks_col.find(query):
+        all_feedback.append({**_feedback_helper(doc), "source": "fdm"})
+    for doc in clients_feedbacks_col.find(query):
+        all_feedback.append({**_feedback_helper(doc), "source": "client"})
+
+    if not all_feedback:
+        return ""
+
+    like_count = sum(1 for f in all_feedback if f.get("reaction") == "like" and not f.get("comment"))
+    dislike_count = sum(1 for f in all_feedback if f.get("reaction") == "dislike" and not f.get("comment"))
+
+    liked_comments = [f["comment"] for f in all_feedback if f.get("reaction") == "like" and f.get("comment")]
+    disliked_comments = [f["comment"] for f in all_feedback if f.get("reaction") == "dislike" and f.get("comment")]
+    neutral_comments = [f["comment"] for f in all_feedback if not f.get("reaction") and f.get("comment") and f.get("source") != "client"]
+    client_comments = [f["comment"] for f in all_feedback if f.get("comment") and f.get("source") == "client"]
+
+    lines = [
+        "HUMAN FEEDBACK ON PREVIOUS VERSION:",
+        f"Reactions: {like_count} likes, {dislike_count} dislikes",
+    ]
+    if liked_comments:
+        lines.append("\nLiked aspects (from users who liked):")
+        for c in liked_comments[:5]:
+            lines.append(f"- {c}")
+    if disliked_comments:
+        lines.append("\nDisliked aspects (from users who disliked):")
+        for c in disliked_comments[:5]:
+            lines.append(f"- {c}")
+    if neutral_comments:
+        lines.append("\nAdditional comments:")
+        for c in neutral_comments[:5]:
+            lines.append(f"- {c}")
+    if client_comments:
+        lines.append("\nClient feedback:")
+        for c in client_comments[:5]:
+            lines.append(f"- [CLIENT] {c}")
+
+    lines.append("\nINSTRUCTION: Address the disliked aspects while preserving the liked aspects. Prioritize client feedback.")
+    return "\n".join(lines)
 
 
 # --- Helpers ---
