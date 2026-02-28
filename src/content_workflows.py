@@ -922,6 +922,19 @@ async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, req
         if research:
             context_parts.append(_build_research_context(research))
 
+        # WS5: Collect feedback context from previous concepts for RL
+        prior_feedback = ""
+        concept_node = db.content_workflow_nodes.find_one({"workflow_id": workflow_id, "stage_key": "concepts"})
+        if concept_node and concept_node.get("output_data"):
+            concepts_len = len(concept_node["output_data"].get("concepts", []))
+            feedback_bits = []
+            for i in range(concepts_len):
+                fb_ctx = _build_feedback_context(workflow_id, "concepts", f"concept_{i}")
+                if fb_ctx:
+                    feedback_bits.append(f"CONCEPT {i}:\n{fb_ctx}")
+            if feedback_bits:
+                prior_feedback = "\n\n--- PRIOR FEEDBACK ON PREVIOUS CONCEPTS ---\n" + "\n\n".join(feedback_bits) + "\n--- END PRIOR FEEDBACK ---"
+
         # Check prior stage outputs from workflow state
         try:
             from src.content_generation.state import WorkflowStateStore
@@ -970,6 +983,7 @@ async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, req
         system_prompt = f"""You are a creative content strategist. Generate {content_type} content concepts based on the following context.
 
 {context_str}
+{prior_feedback}
 
 Return a JSON array of exactly {body.num} concepts with tone "{body.tone}" for {content_type} format.
 {schema_desc}
@@ -1156,6 +1170,34 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         research_data = stage_settings.get("research", {})
         research_visual_context = _build_visual_style_context(research_data) if research_data else ""
 
+        # WS5: Collect feedback for RL
+        feedback_context = ""
+        # 1. Feedback on the source concept
+        concept_fb = _build_feedback_context(workflow_id, "concepts", f"concept_{body.concept_index}")
+        if concept_fb:
+            feedback_context += f"\nFEEDBACK ON THE SOURCE CONCEPT:\n{concept_fb}\n"
+        
+        # 2. Feedback on previous storyboards for this concept
+        storyboard_node = db.content_workflow_nodes.find_one({"workflow_id": workflow_id, "stage_key": "storyboard"})
+        if storyboard_node and storyboard_node.get("output_data"):
+            prev_sbs = storyboard_node["output_data"].get("storyboards", [])
+            concept_sbs = [sb for sb in prev_sbs if sb.get("concept_index") == body.concept_index]
+            sb_feedback_bits = []
+            for i, sb in enumerate(concept_sbs):
+                sb_fb = _build_feedback_context(workflow_id, "storyboard", f"sb_{i}") # this index mapping might need sync with frontend
+                if sb_fb:
+                    sb_feedback_bits.append(f"VARIATION {i}:\n{sb_fb}")
+                # Also check scene feedback
+                for scene in sb.get("scenes", []):
+                    scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"])
+                    if scene_fb:
+                        sb_feedback_bits.append(f"SCENE '{scene['title']}' (in variation {i}):\n{scene_fb}")
+            if sb_feedback_bits:
+                feedback_context += f"\nFEEDBACK ON PREVIOUS STORYBOARD ATTEMPTS:\n" + "\n".join(sb_feedback_bits) + "\n"
+
+        if feedback_context:
+            feedback_context = "\n\n--- PRIOR FEEDBACK & REINFORCEMENT CONTEXT ---\n" + feedback_context + "\n--- END FEEDBACK ---\n"
+
         llm_model = body.llm_model or "gemini-pro-3"
         campaign_id = config.get("campaign_id")
         image_model = body.image_model or "google/nano-banana-pro"
@@ -1168,6 +1210,7 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
 {research_visual_context}
 
 Concept: {json.dumps(concept)}
+{feedback_context}
 
 You must:
 1. Write a 1-2 sentence storyline summarizing the narrative arc.
@@ -1230,6 +1273,7 @@ Return ONLY valid JSON:
 
 Concept: {json.dumps(concept)}
 Storyline: {storyline}
+{feedback_context}
 
 CHARACTERS (already defined — reference these by ID):
 {chars_json}
@@ -2132,6 +2176,21 @@ async def generate_video(
         characters = storyboard.get("characters", [])
         storyline = storyboard.get("storyline", "")
 
+        # WS5: Collect feedback for RL
+        feedback_bits = []
+        for scene in scenes:
+            scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"])
+            if scene_fb:
+                feedback_bits.append(f"SCENE '{scene['title']}':\n{scene_fb}")
+        for char in characters:
+            char_fb = _build_feedback_context(workflow_id, "storyboard", char["id"])
+            if char_fb:
+                feedback_bits.append(f"CHARACTER '{char['name']}':\n{char_fb}")
+        
+        feedback_context = ""
+        if feedback_bits:
+            feedback_context = "\n\n--- PRIOR FEEDBACK ON STORYBOARD ---\n" + "\n\n".join(feedback_bits) + "\n--- END FEEDBACK ---\n"
+
         # Create a task for tracking
         import uuid
         task_id = str(uuid.uuid4())
@@ -2171,6 +2230,7 @@ async def generate_video(
             resolution=body.resolution,
             temperature=body.temperature,
             custom_prompt=body.custom_prompt,
+            feedback_context=feedback_context, # WS5
         )
 
         return {"task_id": task_id, "status": "pending", "model": body.model, "count": body.count}
@@ -2565,12 +2625,14 @@ async def _run_video_generation(
     resolution: str | None,
     temperature: float | None,
     custom_prompt: str | None = None,
+    feedback_context: str | None = None, # WS5
 ):
     """Background task: generate videos SEQUENTIALLY one scene at a time (WS6)."""
     import httpx
     import asyncio
 
     try:
+        loop = asyncio.get_event_loop()
         db.video_generation_jobs.update_one(
             {"task_id": task_id},
             {"$set": {"status": "running", "updated_at": datetime.utcnow()}},
@@ -2625,10 +2687,14 @@ async def _run_video_generation(
                         scene_prompt = scene_prompt.replace("{characters}", char_desc)
                         scene_prompt = scene_prompt.replace("{shot_type}", scene.get("shot_type", ""))
                         scene_prompt = scene_prompt.replace("{duration_hint}", duration_hint)
+                        if feedback_context:
+                            scene_prompt = feedback_context + "\n\n" + scene_prompt
                         if continuity_ctx:
                             scene_prompt = continuity_ctx + "\n\n" + scene_prompt
                     else:
                         scene_prompt = f"Storyline context: {storyline}\n\n"
+                        if feedback_context:
+                            scene_prompt += feedback_context + "\n\n"
                         if continuity_ctx:
                             scene_prompt += continuity_ctx + "\n\n"
                         scene_prompt += f"Now generate Scene {scene.get('scene_number', j + 1)}: {scene.get('title', '')}. {scene.get('description', '')}."
@@ -2682,10 +2748,11 @@ async def _run_video_generation(
 
                     # WS6: Wait for this scene to complete before starting the next
                     if entry.get("external_id") and entry["status"] != "failed":
-                        if is_google_direct:
-                            for _ in range(120):  # max ~20 min wait per scene
-                                await asyncio.sleep(POLL_INTERVAL)
-                                try:
+                        max_attempts = 120  # ~20 min wait
+                        for _ in range(max_attempts):
+                            await asyncio.sleep(POLL_INTERVAL)
+                            try:
+                                if is_google_direct:
                                     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
                                     api_base = "https://generativelanguage.googleapis.com/v1beta"
                                     poll_resp = await http.get(
@@ -2695,15 +2762,38 @@ async def _run_video_generation(
                                     if poll_resp.status_code == 200:
                                         op = poll_resp.json()
                                         if op.get("done", False):
+                                            entry["status"] = "completed"
                                             break
-                                except Exception:
-                                    pass
-                        elif is_openai_direct:
-                            # OpenAI Sora — wait for completion
-                            await asyncio.sleep(2)
-                        else:
-                            # Replicate — small delay
-                            await asyncio.sleep(2)
+                                elif is_openai_direct:
+                                    from openai import OpenAI as _OpenAI
+                                    openai_client = _OpenAI()
+                                    oai_video = await loop.run_in_executor(
+                                        None, lambda vid=entry["external_id"]: openai_client.videos.retrieve(vid)
+                                    )
+                                    if oai_video.status == "completed":
+                                        entry["status"] = "completed"
+                                        break
+                                    if oai_video.status == "failed":
+                                        entry["status"] = "failed"
+                                        break
+                                else:
+                                    # Replicate
+                                    REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+                                    poll_resp = await http.get(
+                                        entry["external_id"],
+                                        headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                                    )
+                                    if poll_resp.status_code == 200:
+                                        pd = poll_resp.json()
+                                        if pd.get("status") == "succeeded":
+                                            entry["status"] = "completed"
+                                            break
+                                        if pd.get("status") == "failed":
+                                            entry["status"] = "failed"
+                                            break
+                            except Exception as poll_err:
+                                print(f"Polling error for scene {j}: {poll_err}")
+                                # continue polling unless it's a fatal error
 
                     # WS6: After scene completes, derive continuity info and add to scene_state
                     summaries = _derive_visual_summary(scene, characters)
@@ -3308,6 +3398,12 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
             if persona_context:
                 persona_section = "PERSONAS (use these as additional context for scoring):" + persona_context
 
+            # WS5: Collect feedback for RL
+            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id)
+            feedback_prompt = ""
+            if vid_feedback:
+                feedback_prompt = f"\nHUMAN FEEDBACK ON THIS VIDEO:\n{vid_feedback}\n"
+
             prompt = f"""You are an expert marketing analyst. Score how well this specific video would resonate with each demographic segment.
 
 BRAND: {brand_name}
@@ -3323,6 +3419,7 @@ Storyboards:
 {storyboard_summary if storyboard_summary else "No storyboards generated yet."}
 
 VIDEO BEING EVALUATED: {video_desc}
+{feedback_prompt}
 {persona_section}
 DEMOGRAPHIC SEGMENTS TO SCORE:
 {combos_str}
@@ -3571,6 +3668,12 @@ async def run_predictive_modeling(workflow_id: str, body: PredictRequest, reques
             if vid_type == "stitched":
                 video_desc += " — full stitched video from all scenes"
 
+            # WS5: Collect feedback for RL
+            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id)
+            feedback_prompt = ""
+            if vid_feedback:
+                feedback_prompt = f"\nHUMAN FEEDBACK ON THIS VIDEO:\n{vid_feedback}\n"
+
             prompt = f"""You are an expert social media marketing analyst specializing in Instagram Reels performance prediction.
 
 Given the brand context, content details, and real Instagram benchmark data below, predict the expected performance KPIs for this specific video if posted as an Instagram Reel.
@@ -3588,6 +3691,7 @@ Storyboards:
 {storyboard_summary if storyboard_summary else "No storyboards available."}
 
 VIDEO BEING EVALUATED: {video_desc}
+{feedback_prompt}
 {benchmark_context}
 
 Based on the benchmark data and content analysis, predict the following KPIs for this video:
