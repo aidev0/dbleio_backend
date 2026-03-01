@@ -197,6 +197,16 @@ class CalendarItemUpdate(BaseModel):
     title: Optional[str] = None
     status: Optional[Literal["scheduled", "draft", "published", "archived"]] = None
 
+    @field_validator("date", "start_date", "end_date", mode="before")
+    @classmethod
+    def validate_date_format(cls, v):
+        if v is not None:
+            try:
+                datetime.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"Date must be in YYYY-MM-DD format, got: {v}")
+        return v
+
 
 # --- WS4: Feedback Models ---
 
@@ -1581,8 +1591,9 @@ Return ONLY valid JSON for a single scene:
 async def get_storyboard_status(workflow_id: str, task_id: str, request: Request):
     """Check status of a storyboard generation job."""
     try:
-        from src.auth import get_workos_user_id
-        get_workos_user_id(request)  # validate if JWT present, but allow API key
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
 
         job = db.storyboard_generation_jobs.find_one({"task_id": task_id, "workflow_id": workflow_id})
         if not job:
@@ -3801,12 +3812,12 @@ Score based on:
         if not results:
             raise HTTPException(status_code=500, detail="LLM returned no results for any video")
 
-        # Save to simulation_testing node output_data
+        # Save to simulation_testing node — accumulate per content_id
         sim_node = db.content_workflow_nodes.find_one({
             "workflow_id": workflow_id,
             "stage_key": "simulation_testing",
         })
-        output_data = {
+        run_entry = {
             "results": results,
             "content_id": body.content_id,
             "config": {
@@ -3817,7 +3828,17 @@ Score based on:
             },
             "run_at": datetime.utcnow().isoformat(),
         }
+        content_key = body.content_id or "_default"
         if sim_node:
+            existing_output = sim_node.get("output_data", {})
+            by_content = existing_output.get("by_content", {})
+            by_content[content_key] = run_entry
+            output_data = {
+                **existing_output,
+                "results": results,
+                "content_id": body.content_id,
+                "by_content": by_content,
+            }
             db.content_workflow_nodes.update_one(
                 {"_id": sim_node["_id"]},
                 {"$set": {
@@ -3829,6 +3850,11 @@ Score based on:
         else:
             # Determine stage_index
             stage_index = STAGE_ORDER.index("simulation_testing") if "simulation_testing" in STAGE_ORDER else 7
+            output_data = {
+                "results": results,
+                "content_id": body.content_id,
+                "by_content": {content_key: run_entry},
+            }
             db.content_workflow_nodes.insert_one({
                 "workflow_id": workflow_id,
                 "stage_key": "simulation_testing",
@@ -4082,19 +4108,30 @@ Guidelines:
         if not predictions:
             raise HTTPException(status_code=500, detail="LLM returned no predictions")
 
-        # Save to predictive_modeling node
-        output_data = {
+        # Save to predictive_modeling node — accumulate per content_id
+        run_entry = {
             "predictions": predictions,
             "benchmarks": benchmarks,
             "model_name": llm_model,
             "content_id": body.content_id,
             "run_at": datetime.utcnow().isoformat(),
         }
+        content_key = body.content_id or "_default"
         pred_node = db.content_workflow_nodes.find_one({
             "workflow_id": workflow_id,
             "stage_key": "predictive_modeling",
         })
         if pred_node:
+            existing_output = pred_node.get("output_data", {})
+            by_content = existing_output.get("by_content", {})
+            by_content[content_key] = run_entry
+            output_data = {
+                **existing_output,
+                "predictions": predictions,
+                "benchmarks": benchmarks,
+                "content_id": body.content_id,
+                "by_content": by_content,
+            }
             db.content_workflow_nodes.update_one(
                 {"_id": pred_node["_id"]},
                 {"$set": {
@@ -4105,6 +4142,12 @@ Guidelines:
             )
         else:
             stage_index = STAGE_ORDER.index("predictive_modeling") if "predictive_modeling" in STAGE_ORDER else 9
+            output_data = {
+                "predictions": predictions,
+                "benchmarks": benchmarks,
+                "content_id": body.content_id,
+                "by_content": {content_key: run_entry},
+            }
             db.content_workflow_nodes.insert_one({
                 "workflow_id": workflow_id,
                 "stage_key": "predictive_modeling",
@@ -4148,9 +4191,13 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
 
         nodes = {n["stage_key"]: n for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
 
-        # Get simulation results
+        # Get simulation results — prefer by_content scoped data
         sim_output = nodes.get("simulation_testing", {}).get("output_data", {})
-        sim_results = sim_output.get("results", [])
+        sim_by_content = sim_output.get("by_content", {})
+        if body.content_id and body.content_id in sim_by_content:
+            sim_results = sim_by_content[body.content_id].get("results", [])
+        else:
+            sim_results = sim_output.get("results", [])
 
         # Also check for test-based results
         sim_tests = sim_output.get("tests", [])
@@ -4158,9 +4205,15 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
             if isinstance(t, dict) and t.get("results"):
                 sim_results.extend(t["results"])
 
-        # Get prediction results
+        # Get prediction results — prefer by_content scoped data
         pred_output = nodes.get("predictive_modeling", {}).get("output_data", {})
-        predictions = pred_output.get("predictions", [])
+        pred_by_content = pred_output.get("by_content", {})
+        pred_benchmarks = pred_output.get("benchmarks", {})
+        if body.content_id and body.content_id in pred_by_content:
+            predictions = pred_by_content[body.content_id].get("predictions", [])
+            pred_benchmarks = pred_by_content[body.content_id].get("benchmarks", pred_benchmarks)
+        else:
+            predictions = pred_output.get("predictions", [])
         sim_results = [r for r in sim_results if r.get("content_id") == body.content_id]
         predictions = [p for p in predictions if p.get("content_id") == body.content_id]
 
@@ -4179,7 +4232,7 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
 
         # Compute normalized prediction score per video (0-100 scale)
         # Based on how predicted engagement compares to benchmarks
-        benchmarks = pred_output.get("benchmarks", {})
+        benchmarks = pred_benchmarks
         brand_bench = benchmarks.get("brand", {})
         brand_avg_views = brand_bench.get("avg_views", 1) or 1
         brand_avg_likes = brand_bench.get("avg_likes", 1) or 1
@@ -4229,18 +4282,28 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
         for i, r in enumerate(ranked):
             r["rank"] = i + 1
 
-        # Save to content_ranking node
-        output_data = {
+        # Save to content_ranking node — accumulate per content_id
+        run_entry = {
             "rankings": ranked,
             "weights": {"simulation": sim_w, "prediction": pred_w},
             "content_id": body.content_id,
             "run_at": datetime.utcnow().isoformat(),
         }
+        content_key = body.content_id or "_default"
         rank_node = db.content_workflow_nodes.find_one({
             "workflow_id": workflow_id,
             "stage_key": "content_ranking",
         })
         if rank_node:
+            existing_output = rank_node.get("output_data", {})
+            by_content = existing_output.get("by_content", {})
+            by_content[content_key] = run_entry
+            output_data = {
+                **existing_output,
+                "rankings": ranked,
+                "content_id": body.content_id,
+                "by_content": by_content,
+            }
             db.content_workflow_nodes.update_one(
                 {"_id": rank_node["_id"]},
                 {"$set": {
@@ -4251,6 +4314,11 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
             )
         else:
             stage_index = STAGE_ORDER.index("content_ranking") if "content_ranking" in STAGE_ORDER else 10
+            output_data = {
+                "rankings": ranked,
+                "content_id": body.content_id,
+                "by_content": {content_key: run_entry},
+            }
             db.content_workflow_nodes.insert_one({
                 "workflow_id": workflow_id,
                 "stage_key": "content_ranking",
