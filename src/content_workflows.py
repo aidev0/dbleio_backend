@@ -34,22 +34,29 @@ contents_calendar.create_index([("brand_id", 1)])
 contents_calendar.create_index([("organization_id", 1)])
 contents_calendar.create_index([("date", 1)])
 
+# Drop legacy reaction index that did not include content_id.
+for _col in (fdms_feedbacks_col, clients_feedbacks_col):
+    try:
+        _col.drop_index("user_id_1_workflow_id_1_stage_key_1_item_id_1_comment_1")
+    except Exception:
+        pass
+
 # Indexes — fdms_feedbacks
 fdms_feedbacks_col.create_index(
-    [("user_id", 1), ("workflow_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
+    [("user_id", 1), ("workflow_id", 1), ("content_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
     unique=True,
     partialFilterExpression={"comment": None},
 )
-fdms_feedbacks_col.create_index([("workflow_id", 1), ("stage_key", 1), ("item_id", 1)])
+fdms_feedbacks_col.create_index([("workflow_id", 1), ("content_id", 1), ("stage_key", 1), ("item_id", 1)])
 fdms_feedbacks_col.create_index([("content_id", 1)])
 
 # Indexes — clients_feedbacks
 clients_feedbacks_col.create_index(
-    [("user_id", 1), ("workflow_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
+    [("user_id", 1), ("workflow_id", 1), ("content_id", 1), ("stage_key", 1), ("item_id", 1), ("comment", 1)],
     unique=True,
     partialFilterExpression={"comment": None},
 )
-clients_feedbacks_col.create_index([("workflow_id", 1), ("stage_key", 1), ("item_id", 1)])
+clients_feedbacks_col.create_index([("workflow_id", 1), ("content_id", 1), ("stage_key", 1), ("item_id", 1)])
 clients_feedbacks_col.create_index([("content_id", 1)])
 
 
@@ -929,7 +936,7 @@ async def generate_concepts(workflow_id: str, body: GenerateConceptsRequest, req
             concepts_len = len(concept_node["output_data"].get("concepts", []))
             feedback_bits = []
             for i in range(concepts_len):
-                fb_ctx = _build_feedback_context(workflow_id, "concepts", f"concept_{i}")
+                fb_ctx = _build_feedback_context(workflow_id, "concepts", f"concept_{i}", body.content_id)
                 if fb_ctx:
                     feedback_bits.append(f"CONCEPT {i}:\n{fb_ctx}")
             if feedback_bits:
@@ -1137,12 +1144,17 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         from src.content_generation.state import WorkflowStateStore
         state_data = WorkflowStateStore.get_state_data(workflow_id)
         concepts_output = state_data.get("stage_outputs", {}).get("concepts", {})
-        concepts_list = concepts_output.get("concepts", [])
+        concepts_list = []
 
         # Also check stageSettings saved concepts (per-piece first, then top-level fallback)
         config = workflow.get("config") or {}
         stage_settings = config.get("stage_settings", {})
         concepts_settings = stage_settings.get("concepts", {})
+        if body.content_id:
+            selected_piece = concepts_settings.get("pieces", {}).get(body.content_id, {})
+            concepts_list = selected_piece.get("generated_concepts", []) or []
+        if not concepts_list:
+            concepts_list = concepts_output.get("concepts", [])
         if not concepts_list:
             for piece_data in concepts_settings.get("pieces", {}).values():
                 piece_concepts = piece_data.get("generated_concepts", [])
@@ -1173,7 +1185,7 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         # WS5: Collect feedback for RL
         feedback_context = ""
         # 1. Feedback on the source concept
-        concept_fb = _build_feedback_context(workflow_id, "concepts", f"concept_{body.concept_index}")
+        concept_fb = _build_feedback_context(workflow_id, "concepts", f"concept_{body.concept_index}", body.content_id)
         if concept_fb:
             feedback_context += f"\nFEEDBACK ON THE SOURCE CONCEPT:\n{concept_fb}\n"
         
@@ -1181,15 +1193,19 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         storyboard_node = db.content_workflow_nodes.find_one({"workflow_id": workflow_id, "stage_key": "storyboard"})
         if storyboard_node and storyboard_node.get("output_data"):
             prev_sbs = storyboard_node["output_data"].get("storyboards", [])
-            concept_sbs = [sb for sb in prev_sbs if sb.get("concept_index") == body.concept_index]
+            concept_sbs = [
+                sb for sb in prev_sbs
+                if sb.get("concept_index") == body.concept_index
+                and (not body.content_id or sb.get("content_id") == body.content_id)
+            ]
             sb_feedback_bits = []
             for i, sb in enumerate(concept_sbs):
-                sb_fb = _build_feedback_context(workflow_id, "storyboard", f"sb_{i}") # this index mapping might need sync with frontend
+                sb_fb = _build_feedback_context(workflow_id, "storyboard", f"sb_{i}", body.content_id) # this index mapping might need sync with frontend
                 if sb_fb:
                     sb_feedback_bits.append(f"VARIATION {i}:\n{sb_fb}")
                 # Also check scene feedback
                 for scene in sb.get("scenes", []):
-                    scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"])
+                    scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"], body.content_id)
                     if scene_fb:
                         sb_feedback_bits.append(f"SCENE '{scene['title']}' (in variation {i}):\n{scene_fb}")
             if sb_feedback_bits:
@@ -1332,12 +1348,17 @@ Return ONLY valid JSON for a single scene:
         existing_output = storyboard_node.get("output_data", {}) if storyboard_node else {}
         existing_storyboards = existing_output.get("storyboards", [])
 
-        existing_for_concept = [sb for sb in existing_storyboards if sb.get("concept_index") == body.concept_index]
+        existing_for_concept = [
+            sb for sb in existing_storyboards
+            if sb.get("concept_index") == body.concept_index
+            and (not body.content_id or sb.get("content_id") == body.content_id)
+        ]
         variation_index = len(existing_for_concept)
 
         storyboard_entry = {
             "concept_index": body.concept_index,
             "variation_index": variation_index,
+            "content_id": body.content_id,
             "concept_title": concept_title,
             "storyline": storyline,
             "total_cuts": total_cuts,
@@ -1532,7 +1553,11 @@ async def generate_storyboard_image(
 
         # Find the storyboard for this concept_index + variation_index
         storyboard = None
-        concept_matches = [sb for sb in storyboards if sb.get("concept_index") == body.concept_index]
+        concept_matches = [
+            sb for sb in storyboards
+            if sb.get("concept_index") == body.concept_index
+            and (not body.content_id or sb.get("content_id") == body.content_id)
+        ]
         if body.variation_index < len(concept_matches):
             storyboard = concept_matches[body.variation_index]
         elif concept_matches:
@@ -1609,6 +1634,7 @@ async def generate_storyboard_image(
             metadata={
                 "workflow_id": workflow_id,
                 "concept_index": body.concept_index,
+                "content_id": body.content_id,
                 "target_type": body.target_type,
                 "target_id": body.target_id,
                 "image_model": image_model,
@@ -1625,6 +1651,7 @@ async def generate_storyboard_image(
             body.target_id,
             image_prompt,
             image_model,
+            body.content_id,
         )
 
         return {"task_id": task_id}
@@ -1665,6 +1692,7 @@ async def _generate_storyboard_image_background(
     target_id: str,
     image_prompt: str,
     image_model: str,
+    content_id: Optional[str] = None,
 ):
     """Background task: call Replicate API, upload to GCS, update node."""
     import httpx
@@ -1781,12 +1809,17 @@ async def _generate_storyboard_image_background(
         if storyboard_node:
             output = storyboard_node.get("output_data", {})
             storyboards = output.get("storyboards", [])
-            concept_matches = [sb for sb in storyboards if sb.get("concept_index") == concept_index]
+            concept_matches = [
+                sb for sb in storyboards
+                if sb.get("concept_index") == concept_index
+                and (not content_id or sb.get("content_id") == content_id)
+            ]
             sb = concept_matches[variation_index] if variation_index < len(concept_matches) else (concept_matches[0] if concept_matches else None)
             if sb:
                 collection = sb.get("characters" if target_type == "character" else "scenes", [])
                 for item in collection:
                     if item.get("id") == target_id:
+                        item["content_id"] = content_id
                         item["image_url"] = signed_url
                         item["gs_uri"] = gs_uri
                         item["image_model"] = image_model
@@ -1849,7 +1882,7 @@ async def generate_concept_image(
         # Load concepts from workflow config
         config = workflow.get("config", {})
         stage_settings = config.get("stage_settings", {})
-        piece_key = body.content_piece_key
+        piece_key = body.content_piece_key or body.content_id
 
         concepts = []
         if piece_key:
@@ -1918,6 +1951,7 @@ async def generate_concept_image(
                 "slide_index": body.slide_index,
                 "image_model": image_model,
                 "content_piece_key": piece_key,
+                "content_id": body.content_id,
             }
         )
 
@@ -1930,6 +1964,7 @@ async def generate_concept_image(
             image_prompt,
             image_model,
             piece_key,
+            body.content_id,
         )
 
         return {"task_id": task_id}
@@ -1948,6 +1983,7 @@ async def _generate_concept_image_background(
     image_prompt: str,
     image_model: str,
     content_piece_key: Optional[str],
+    content_id: Optional[str] = None,
 ):
     """Background task: call Replicate API, upload to GCS, update node & config."""
     import httpx
@@ -2060,6 +2096,7 @@ async def _generate_concept_image_background(
         image_record = {
             "concept_index": concept_index,
             "slide_index": slide_index,
+            "content_id": content_id,
             "image_url": signed_url,
             "gs_uri": gs_uri,
             "image_model": image_model,
@@ -2166,7 +2203,13 @@ async def generate_video(
             raise HTTPException(status_code=400, detail="No storyboard found. Generate a storyboard first.")
 
         output_data = storyboard_node["output_data"]
-        storyboards = output_data.get("storyboards", [])
+        storyboards_all = output_data.get("storyboards", [])
+        storyboards = [
+            sb for sb in storyboards_all
+            if not body.content_id or sb.get("content_id") == body.content_id
+        ]
+        if body.content_id and not storyboards:
+            raise HTTPException(status_code=400, detail="No storyboard found for selected content_id")
 
         if body.storyboard_index < 0 or body.storyboard_index >= len(storyboards):
             raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {body.storyboard_index}. Available: 0-{len(storyboards)-1}")
@@ -2179,11 +2222,11 @@ async def generate_video(
         # WS5: Collect feedback for RL
         feedback_bits = []
         for scene in scenes:
-            scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"])
+            scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"], body.content_id)
             if scene_fb:
                 feedback_bits.append(f"SCENE '{scene['title']}':\n{scene_fb}")
         for char in characters:
-            char_fb = _build_feedback_context(workflow_id, "storyboard", char["id"])
+            char_fb = _build_feedback_context(workflow_id, "storyboard", char["id"], body.content_id)
             if char_fb:
                 feedback_bits.append(f"CHARACTER '{char['name']}':\n{char_fb}")
         
@@ -2202,7 +2245,7 @@ async def generate_video(
         job = {
             "task_id": task_id,
             "workflow_id": workflow_id,
-            "content_id": body.content_id,  # WS2/WS7
+            "content_id": body.content_id or storyboard.get("content_id"),  # WS2/WS7
             "storyboard_index": body.storyboard_index,
             "model": body.model,
             "count": body.count,
@@ -2231,6 +2274,7 @@ async def generate_video(
             temperature=body.temperature,
             custom_prompt=body.custom_prompt,
             feedback_context=feedback_context, # WS5
+            content_id=body.content_id or storyboard.get("content_id"),
         )
 
         return {"task_id": task_id, "status": "pending", "model": body.model, "count": body.count}
@@ -2626,6 +2670,7 @@ async def _run_video_generation(
     temperature: float | None,
     custom_prompt: str | None = None,
     feedback_context: str | None = None, # WS5
+    content_id: Optional[str] = None,  # WS2/WS7
 ):
     """Background task: generate videos SEQUENTIALLY one scene at a time (WS6)."""
     import httpx
@@ -2715,6 +2760,7 @@ async def _run_video_generation(
                         "set_index": set_idx,
                         "scene_index": j,
                         "scene_number": scene.get("scene_number", j + 1),
+                        "content_id": content_id,
                         "model": model,
                         "prompt": scene_prompt,
                         "duration_hint": duration_hint,
@@ -2795,18 +2841,19 @@ async def _run_video_generation(
                                 print(f"Polling error for scene {j}: {poll_err}")
                                 # continue polling unless it's a fatal error
 
-                    # WS6: After scene completes, derive continuity info and add to scene_state
-                    summaries = _derive_visual_summary(scene, characters)
-                    completed_scene_info = {
-                        "scene_number": scene.get("scene_number", j + 1),
-                        "title": scene.get("title", ""),
-                        "description": scene.get("description", ""),
-                        "visual_summary": summaries["visual_summary"],
-                        "final_frame_description": summaries["final_frame_description"],
-                        "duration": duration_hint,
-                        "characters_shown": scene.get("character_ids", []),
-                    }
-                    scene_state["completed_scenes"].append(completed_scene_info)
+                    # WS6: After a scene completes, derive continuity info and add to scene_state
+                    if entry.get("status") == "completed":
+                        summaries = _derive_visual_summary(scene, characters)
+                        completed_scene_info = {
+                            "scene_number": scene.get("scene_number", j + 1),
+                            "title": scene.get("title", ""),
+                            "description": scene.get("description", ""),
+                            "visual_summary": summaries["visual_summary"],
+                            "final_frame_description": summaries["final_frame_description"],
+                            "duration": duration_hint,
+                            "characters_shown": scene.get("character_ids", []),
+                        }
+                        scene_state["completed_scenes"].append(completed_scene_info)
 
                     # Update continuity notes
                     all_chars_shown = set()
@@ -3205,7 +3252,14 @@ async def _stitch_scene_videos(workflow_id: str, task_id: str, set_idx: int, vid
                     {"task_id": task_id},
                     {"$set": {"status": "completed", "updated_at": datetime.utcnow()}},
                 )
-                _write_video_variations_to_node(workflow_id, task_id, job.get("videos", []), sets, model)
+                _write_video_variations_to_node(
+                    workflow_id,
+                    task_id,
+                    job.get("videos", []),
+                    sets,
+                    model,
+                    job.get("content_id"),
+                )
 
     except Exception as e:
         import traceback
@@ -3220,7 +3274,14 @@ async def _stitch_scene_videos(workflow_id: str, task_id: str, set_idx: int, vid
         )
 
 
-def _write_video_variations_to_node(workflow_id: str, task_id: str, videos: list, sets: dict, model: str):
+def _write_video_variations_to_node(
+    workflow_id: str,
+    task_id: str,
+    videos: list,
+    sets: dict,
+    model: str,
+    content_id: Optional[str] = None,
+):
     """Write one variation per completed stitched set to the video_generation node's output_data."""
     variations = []
     for set_idx_str, set_info in sorted(sets.items(), key=lambda x: int(x[0])):
@@ -3233,6 +3294,7 @@ def _write_video_variations_to_node(workflow_id: str, task_id: str, videos: list
                 "preview": stitched_url,
                 "type": "video",
                 "status": "draft",
+                "content_id": content_id,
             }
             gs_uri = set_info.get("gs_uri")
             if gs_uri:
@@ -3291,6 +3353,8 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         workflow = _verify_workflow_access(workflow_id, workos_user_id)
+        if not body.content_id:
+            raise HTTPException(status_code=400, detail="content_id is required")
 
         # Gather context from workflow and related data
         brand = db.brands.find_one({"_id": ObjectId(workflow["brand_id"])}) if workflow.get("brand_id") else None
@@ -3307,24 +3371,29 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
         concepts_output = nodes.get("concepts", {}).get("output_data", {})
         storyboard_output = nodes.get("storyboard", {}).get("output_data", {})
         video_output = nodes.get("video_generation", {}).get("output_data", {})
+        concepts_settings = (workflow.get("config") or {}).get("stage_settings", {}).get("concepts", {})
 
         concepts_summary = ""
-        for c in concepts_output.get("concepts", [])[:3]:
+        scoped_concepts = concepts_settings.get("pieces", {}).get(body.content_id, {}).get("generated_concepts", [])
+        if not scoped_concepts:
+            scoped_concepts = concepts_output.get("concepts", [])
+        for c in scoped_concepts[:3]:
             concepts_summary += f"- {c.get('title', 'Untitled')}: {c.get('hook', '')}\n"
 
         storyboard_summary = ""
-        for sb in storyboard_output.get("storyboards", [])[:2]:
+        scoped_storyboards = [sb for sb in storyboard_output.get("storyboards", []) if sb.get("content_id") == body.content_id]
+        for sb in scoped_storyboards[:2]:
             storyboard_summary += f"- Storyline: {sb.get('storyline', '')[:200]}\n"
             storyboard_summary += f"  Scenes: {len(sb.get('scenes', []))} cuts\n"
 
         all_variations = video_output.get("variations", [])
         # Get full videos (stitched + video types) for simulation
         full_videos = [v for v in all_variations if v.get("type") in ("stitched", "video") and v.get("preview")]
+        full_videos = [v for v in full_videos if v.get("content_id") == body.content_id]
         if body.video_ids:
             full_videos = [v for v in full_videos if v.get("id") in body.video_ids]
-        # Fallback: if no full videos, use all variations
         if not full_videos:
-            full_videos = [{"id": "all", "title": "All Content", "model": "", "type": "all"}]
+            raise HTTPException(status_code=400, detail="No videos found for selected content_id")
 
         # Fetch persona context if persona_ids provided
         persona_context = ""
@@ -3399,7 +3468,7 @@ async def run_simulation(workflow_id: str, body: RunSimulationRequest, request: 
                 persona_section = "PERSONAS (use these as additional context for scoring):" + persona_context
 
             # WS5: Collect feedback for RL
-            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id)
+            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id, body.content_id)
             feedback_prompt = ""
             if vid_feedback:
                 feedback_prompt = f"\nHUMAN FEEDBACK ON THIS VIDEO:\n{vid_feedback}\n"
@@ -3457,6 +3526,7 @@ Score based on:
                 r["score"] = max(0, min(100, int(r.get("score", 0))))
                 r["video_id"] = vid_id
                 r["video_title"] = vid_title
+                r["content_id"] = vid.get("content_id") or body.content_id
             all_results.extend(vid_results)
 
         results = all_results
@@ -3470,6 +3540,7 @@ Score based on:
         })
         output_data = {
             "results": results,
+            "content_id": body.content_id,
             "config": {
                 "genders": body.genders,
                 "ages": body.ages,
@@ -3581,6 +3652,8 @@ async def run_predictive_modeling(workflow_id: str, body: PredictRequest, reques
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         workflow = _verify_workflow_access(workflow_id, workos_user_id)
+        if not body.content_id:
+            raise HTTPException(status_code=400, detail="content_id is required")
 
         config = workflow.get("config") or {}
 
@@ -3598,19 +3671,29 @@ async def run_predictive_modeling(workflow_id: str, body: PredictRequest, reques
         concepts_output = nodes.get("concepts", {}).get("output_data", {})
         storyboard_output = nodes.get("storyboard", {}).get("output_data", {})
         video_output = nodes.get("video_generation", {}).get("output_data", {})
+        concepts_settings = (workflow.get("config") or {}).get("stage_settings", {}).get("concepts", {})
 
         concepts_summary = ""
-        for c in concepts_output.get("concepts", [])[:3]:
+        scoped_concepts = concepts_settings.get("pieces", {}).get(body.content_id, {}).get("generated_concepts", [])
+        if not scoped_concepts:
+            scoped_concepts = concepts_output.get("concepts", [])
+        for c in scoped_concepts[:3]:
             concepts_summary += f"- {c.get('title', 'Untitled')}: {c.get('hook', '')}\n"
 
         storyboard_summary = ""
-        for sb in storyboard_output.get("storyboards", [])[:2]:
+        selected_storyboards = [sb for sb in storyboard_output.get("storyboards", []) if sb.get("content_id") == body.content_id]
+        for sb in selected_storyboards[:2]:
             storyboard_summary += f"- Storyline: {sb.get('storyline', '')[:200]}\n"
             storyboard_summary += f"  Scenes: {len(sb.get('scenes', []))} cuts\n"
 
         # Get stitched/video variations
         all_variations = video_output.get("variations", [])
-        full_videos = [v for v in all_variations if v.get("type") in ("stitched", "video") and v.get("preview")]
+        full_videos = [
+            v for v in all_variations
+            if v.get("type") in ("stitched", "video")
+            and v.get("preview")
+            and v.get("content_id") == body.content_id
+        ]
         if body.video_ids:
             full_videos = [v for v in full_videos if v.get("id") in body.video_ids]
         if not full_videos:
@@ -3669,7 +3752,7 @@ async def run_predictive_modeling(workflow_id: str, body: PredictRequest, reques
                 video_desc += " — full stitched video from all scenes"
 
             # WS5: Collect feedback for RL
-            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id)
+            vid_feedback = _build_feedback_context(workflow_id, "video_generation", vid_id, vid.get("content_id") or body.content_id)
             feedback_prompt = ""
             if vid_feedback:
                 feedback_prompt = f"\nHUMAN FEEDBACK ON THIS VIDEO:\n{vid_feedback}\n"
@@ -3719,6 +3802,7 @@ Guidelines:
             if result:
                 result["video_id"] = vid_id
                 result["video_title"] = vid_title
+                result["content_id"] = vid.get("content_id") or body.content_id
                 # Clamp values
                 for k in ("expected_views", "expected_likes", "expected_comments"):
                     result[k] = max(0, int(result.get(k, 0)))
@@ -3734,6 +3818,7 @@ Guidelines:
             "predictions": predictions,
             "benchmarks": benchmarks,
             "model_name": llm_model,
+            "content_id": body.content_id,
             "run_at": datetime.utcnow().isoformat(),
         }
         pred_node = db.content_workflow_nodes.find_one({
@@ -3788,6 +3873,8 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         _verify_workflow_access(workflow_id, workos_user_id)
+        if not body.content_id:
+            raise HTTPException(status_code=400, detail="content_id is required")
 
         nodes = {n["stage_key"]: n for n in db.content_workflow_nodes.find({"workflow_id": workflow_id})}
 
@@ -3804,6 +3891,8 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
         # Get prediction results
         pred_output = nodes.get("predictive_modeling", {}).get("output_data", {})
         predictions = pred_output.get("predictions", [])
+        sim_results = [r for r in sim_results if r.get("content_id") == body.content_id]
+        predictions = [p for p in predictions if p.get("content_id") == body.content_id]
 
         if not predictions:
             raise HTTPException(status_code=400, detail="No prediction results found. Run Predictive Modeling first.")
@@ -3851,6 +3940,7 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
 
             ranked.append({
                 "video_id": vid_id,
+                "content_id": body.content_id,
                 "video_title": p.get("video_title", "Untitled"),
                 "composite_score": composite,
                 "simulation_score": round(sim_score, 1),
@@ -3873,6 +3963,7 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
         output_data = {
             "rankings": ranked,
             "weights": {"simulation": sim_w, "prediction": pred_w},
+            "content_id": body.content_id,
             "run_at": datetime.utcnow().isoformat(),
         }
         rank_node = db.content_workflow_nodes.find_one({
@@ -4145,6 +4236,7 @@ async def submit_feedback(workflow_id: str, body: FeedbackCreate, request: Reque
             existing = col.find_one({
                 "user_id": workos_user_id,
                 "workflow_id": workflow_id,
+                "content_id": body.content_id,
                 "stage_key": body.stage_key,
                 "item_id": body.item_id,
                 "comment": None,
@@ -4214,6 +4306,7 @@ async def get_item_feedback(
     request: Request,
     stage_key: str = "",
     item_id: str = "",
+    content_id: str = "",
 ):
     """Get all feedback for a specific item (from both collections)."""
     try:
@@ -4222,6 +4315,8 @@ async def get_item_feedback(
         _verify_workflow_access(workflow_id, workos_user_id)
 
         query = {"workflow_id": workflow_id}
+        if content_id:
+            query["content_id"] = content_id
         if stage_key:
             query["stage_key"] = stage_key
         if item_id:
@@ -4250,6 +4345,7 @@ async def get_feedback_summary(
     workflow_id: str,
     request: Request,
     stage_key: str = "",
+    content_id: str = "",
 ):
     """Get aggregated feedback counts per item for a stage."""
     try:
@@ -4258,6 +4354,8 @@ async def get_feedback_summary(
         _verify_workflow_access(workflow_id, workos_user_id)
 
         query = {"workflow_id": workflow_id}
+        if content_id:
+            query["content_id"] = content_id
         if stage_key:
             query["stage_key"] = stage_key
 
@@ -4311,9 +4409,11 @@ async def delete_feedback(workflow_id: str, feedback_id: str, request: Request):
 # --- WS5: Feedback Context Builder ---
 
 
-def _build_feedback_context(workflow_id: str, stage_key: str, item_id: str) -> str:
+def _build_feedback_context(workflow_id: str, stage_key: str, item_id: str, content_id: Optional[str] = None) -> str:
     """Query both feedback collections and build structured context for LLM regeneration."""
     query = {"workflow_id": workflow_id, "stage_key": stage_key, "item_id": item_id}
+    if content_id:
+        query["content_id"] = content_id
 
     all_feedback = []
     for doc in fdms_feedbacks_col.find(query):
