@@ -5,14 +5,15 @@ Exposes the content generation orchestrator to the frontend.
 """
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Literal
 from datetime import datetime, timedelta
 from bson import ObjectId
 import os
 import json
+import uuid
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
 load_dotenv()
 
@@ -38,7 +39,6 @@ def ensure_indexes():
     global _indexes_ensured
     if _indexes_ensured:
         return
-    _indexes_ensured = True
 
     try:
         # Indexes — contents_calendar
@@ -71,8 +71,21 @@ def ensure_indexes():
         )
         clients_feedbacks_col.create_index([("workflow_id", 1), ("content_id", 1), ("stage_key", 1), ("item_id", 1)])
         clients_feedbacks_col.create_index([("content_id", 1)])
+
+        # Indexes — video_generation_jobs
+        db.video_generation_jobs.create_index([("task_id", 1)], unique=True)
+
+        # Indexes — storyboard_generation_jobs
+        db.storyboard_generation_jobs.create_index([("task_id", 1)], unique=True)
+        db.storyboard_generation_jobs.create_index([("workflow_id", 1)])
+
+        _indexes_ensured = True
     except Exception as e:
         _logger.warning("Failed to ensure indexes: %s", e)
+
+
+# Call once at import time
+ensure_indexes()
 
 
 # --- Models ---
@@ -161,6 +174,16 @@ class CalendarItemCreate(BaseModel):
     title: Optional[str] = None
     status: Literal["scheduled", "draft", "published", "archived"] = "scheduled"
 
+    @field_validator("date", "start_date", "end_date", mode="before")
+    @classmethod
+    def validate_date_format(cls, v):
+        if v is not None:
+            try:
+                datetime.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"Date must be in YYYY-MM-DD format, got: {v}")
+        return v
+
 
 class CalendarItemUpdate(BaseModel):
     platform: Optional[str] = None
@@ -172,7 +195,7 @@ class CalendarItemUpdate(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     title: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[Literal["scheduled", "draft", "published", "archived"]] = None
 
 
 # --- WS4: Feedback Models ---
@@ -533,7 +556,8 @@ async def create_content_workflow(body: ContentWorkflowCreate, request: Request)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in create_content_workflow")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("")
@@ -569,7 +593,8 @@ async def list_content_workflows(request: Request, brand_id: Optional[str] = Non
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in list_content_workflows")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}")
@@ -593,7 +618,8 @@ async def get_content_workflow(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_content_workflow")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch("/{workflow_id}")
@@ -627,7 +653,8 @@ async def update_content_workflow(workflow_id: str, body: ContentWorkflowUpdate,
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in update_content_workflow")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}", status_code=204)
@@ -654,7 +681,8 @@ async def delete_content_workflow(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_content_workflow")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Pipeline Control ---
@@ -672,7 +700,8 @@ async def get_nodes(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_nodes")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/run")
@@ -690,7 +719,8 @@ async def run_pipeline(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in run_pipeline")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/advance")
@@ -708,7 +738,8 @@ async def advance_stage(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in advance_stage")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/stages/{stage_key}/approve")
@@ -730,7 +761,8 @@ async def approve_stage(workflow_id: str, stage_key: str, body: ApprovalRequest,
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in approve_stage")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/stages/{stage_key}/input")
@@ -755,7 +787,8 @@ async def submit_stage_input(workflow_id: str, stage_key: str, body: HumanInputR
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in submit_stage_input")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 STAGE_ORDER = [
@@ -813,7 +846,8 @@ async def reset_stage(workflow_id: str, stage_key: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in reset_stage")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/chat")
@@ -831,7 +865,8 @@ async def send_chat_message(workflow_id: str, body: ChatMessageRequest, request:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in send_chat_message")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/state")
@@ -848,7 +883,8 @@ async def get_workflow_state(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_workflow_state")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/agent-states")
@@ -865,7 +901,8 @@ async def get_agent_states(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_agent_states")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/transitions")
@@ -882,7 +919,8 @@ async def get_transitions(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_transitions")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/sessions")
@@ -899,7 +937,8 @@ async def get_user_sessions(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_user_sessions")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Concept Generation ---
@@ -1056,7 +1095,8 @@ Return ONLY valid JSON: {{"concepts": [...]}}"""
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in generate_concepts")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Image Models ---
@@ -1073,7 +1113,8 @@ async def get_image_models(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_image_models")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Storyboard Generation ---
@@ -1140,29 +1181,32 @@ async def _call_storyboard_llm(system_prompt: str, user_prompt: str, llm_model: 
 
 
 def _parse_json_from_text(text: str) -> dict:
-    """Extract and parse the first JSON object from LLM text using balanced brace matching."""
-    # Find the first '{' and match balanced braces
+    """Extract the first valid JSON object from LLM response text."""
+    # Try direct parse first
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Find first { and use raw_decode
     start = text.find('{')
     if start == -1:
-        raise HTTPException(status_code=500, detail="Failed to parse JSON from AI response")
-    depth = 0
-    end = start
-    for i in range(start, len(text)):
-        if text[i] == '{':
-            depth += 1
-        elif text[i] == '}':
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-    if depth != 0:
-        raise HTTPException(status_code=500, detail="Failed to parse JSON from AI response")
-    return json.loads(text[start:end])
+        raise HTTPException(status_code=500, detail="No JSON object found in LLM response")
+
+    decoder = json.JSONDecoder()
+    try:
+        result, _ = decoder.raw_decode(text, start)
+        if isinstance(result, dict):
+            return result
+        raise HTTPException(status_code=500, detail="LLM response contained a JSON array, expected object")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse JSON from LLM response: {e}")
 
 
 @router.post("/{workflow_id}/generate-storyboard")
-async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest, request: Request):
-    """Generate a storyboard sequentially — characters + scene 1 first, then each subsequent scene with full prior context."""
+async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest, request: Request, background_tasks: BackgroundTasks):
+    """Generate a storyboard in the background — returns a task_id for polling."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
@@ -1216,7 +1260,7 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         concept_fb = _build_feedback_context(workflow_id, "concepts", f"concept_{body.concept_index}", body.content_id)
         if concept_fb:
             feedback_context += f"\nFEEDBACK ON THE SOURCE CONCEPT:\n{concept_fb}\n"
-        
+
         # 2. Feedback on previous storyboards for this concept
         storyboard_node = db.content_workflow_nodes.find_one({"workflow_id": workflow_id, "stage_key": "storyboard"})
         if storyboard_node and storyboard_node.get("output_data"):
@@ -1228,14 +1272,25 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
             ]
             sb_feedback_bits = []
             for i, sb in enumerate(concept_sbs):
-                sb_fb = _build_feedback_context(workflow_id, "storyboard", f"sb_{i}", body.content_id) # this index mapping might need sync with frontend
-                if sb_fb:
-                    sb_feedback_bits.append(f"VARIATION {i}:\n{sb_fb}")
+                # Backward-compatible: support both local-by-concept and global-flat storyboard IDs.
+                candidate_item_ids = [f"sb_{i}"]
+                try:
+                    global_idx = prev_sbs.index(sb)
+                    candidate_item_ids.append(f"sb_{global_idx}")
+                except ValueError:
+                    pass
+                seen_ctx = set()
+                for item_id in candidate_item_ids:
+                    sb_fb = _build_feedback_context(workflow_id, "storyboard", item_id, body.content_id)
+                    if sb_fb and sb_fb not in seen_ctx:
+                        sb_feedback_bits.append(f"VARIATION {i} ({item_id}):\n{sb_fb}")
+                        seen_ctx.add(sb_fb)
                 # Also check scene feedback
-                for scene in sb.get("scenes", []):
-                    scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"], body.content_id)
+                for j, scene in enumerate(sb.get("scenes", [])):
+                    scene_id = scene.get("id", f"scene_{j}")
+                    scene_fb = _build_feedback_context(workflow_id, "storyboard", scene_id, body.content_id)
                     if scene_fb:
-                        sb_feedback_bits.append(f"SCENE '{scene['title']}' (in variation {i}):\n{scene_fb}")
+                        sb_feedback_bits.append(f"SCENE '{scene.get('title', f'Scene {j}')}' (in variation {i}):\n{scene_fb}")
             if sb_feedback_bits:
                 feedback_context += f"\nFEEDBACK ON PREVIOUS STORYBOARD ATTEMPTS:\n" + "\n".join(sb_feedback_bits) + "\n"
 
@@ -1245,6 +1300,75 @@ async def generate_storyboard(workflow_id: str, body: GenerateStoryboardRequest,
         llm_model = body.llm_model or "gemini-pro-3"
         campaign_id = config.get("campaign_id")
         image_model = body.image_model or "google/nano-banana-pro"
+
+        # Create task tracking document
+        task_id = str(uuid.uuid4())
+        job = {
+            "task_id": task_id,
+            "workflow_id": workflow_id,
+            "content_id": body.content_id,
+            "concept_index": body.concept_index,
+            "status": "pending",
+            "scenes_total": 0,
+            "scenes_done": 0,
+            "message": "Starting storyboard generation...",
+            "storyboard_entry": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        db.storyboard_generation_jobs.insert_one(job)
+
+        # Run generation in background
+        background_tasks.add_task(
+            _run_storyboard_generation,
+            workflow_id=workflow_id,
+            task_id=task_id,
+            concept=concept,
+            concept_title=concept_title,
+            concept_index=body.concept_index,
+            content_id=body.content_id,
+            brand_context=brand_context,
+            research_visual_context=research_visual_context,
+            feedback_context=feedback_context,
+            llm_model=llm_model,
+            campaign_id=campaign_id,
+            image_model=image_model,
+            workos_user_id=workos_user_id,
+        )
+
+        return {"task_id": task_id, "status": "pending"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in generate_storyboard")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+async def _run_storyboard_generation(
+    *,
+    workflow_id: str,
+    task_id: str,
+    concept: dict,
+    concept_title: str,
+    concept_index: int,
+    content_id: str | None,
+    brand_context: str,
+    research_visual_context: str,
+    feedback_context: str,
+    llm_model: str,
+    campaign_id: str | None,
+    image_model: str,
+    workos_user_id: str,
+):
+    """Background task: runs the sequential LLM calls for storyboard generation."""
+
+    def _update_job(**fields):
+        fields["updated_at"] = datetime.utcnow()
+        db.storyboard_generation_jobs.update_one({"task_id": task_id}, {"$set": fields})
+
+    try:
+        _update_job(status="processing", message="Generating storyline, characters, and scene 1...")
 
         # ── Step 1: Generate storyline, characters, and scene 1 ──
         step1_system = f"""You are a creative director specializing in short-form video content. Generate the foundation of a storyboard for this concept.
@@ -1300,12 +1424,30 @@ Return ONLY valid JSON:
         storyboard_data = _parse_json_from_text(step1_text)
 
         characters = storyboard_data.get("characters", [])
+        if not isinstance(characters, list):
+            characters = []
+
         scenes = storyboard_data.get("scenes", [])
-        total_cuts = storyboard_data.get("total_cuts", 1)
+        if not isinstance(scenes, list):
+            scenes = []
+
+        raw_total_cuts = storyboard_data.get("total_cuts", 1)
+        try:
+            total_cuts = int(raw_total_cuts)
+        except (TypeError, ValueError):
+            total_cuts = 1
+        total_cuts = max(1, min(total_cuts, 12))
+
         storyline = storyboard_data.get("storyline", "")
+        if not isinstance(storyline, str):
+            storyline = str(storyline)
+
+        _update_job(scenes_total=total_cuts, scenes_done=1, message=f"Scene 1 of {total_cuts} done.")
 
         # ── Step 2..N: Generate remaining scenes sequentially ──
         for scene_num in range(2, total_cuts + 1):
+            _update_job(message=f"Generating scene {scene_num} of {total_cuts}...")
+
             prev_scenes_json = json.dumps(scenes, indent=2)
             chars_json = json.dumps(characters, indent=2)
 
@@ -1353,10 +1495,15 @@ Return ONLY valid JSON for a single scene:
 
             scene_text = await _call_storyboard_llm(step_n_system, f"Generate scene {scene_num} of {total_cuts}.", llm_model, workos_user_id, campaign_id)
             scene_data = _parse_json_from_text(scene_text)
+            if not isinstance(scene_data, dict):
+                _update_job(status="failed", message=f"Invalid scene payload for scene {scene_num}")
+                return
             # Ensure correct scene_number and id
             scene_data["scene_number"] = scene_num
             scene_data["id"] = scene_data.get("id", f"scene_{scene_num - 1}")
             scenes.append(scene_data)
+
+            _update_job(scenes_done=scene_num, message=f"Scene {scene_num} of {total_cuts} done.")
 
         # ── Add metadata to characters and scenes ──
         for char in characters:
@@ -1378,15 +1525,16 @@ Return ONLY valid JSON for a single scene:
 
         existing_for_concept = [
             sb for sb in existing_storyboards
-            if sb.get("concept_index") == body.concept_index
-            and (not body.content_id or sb.get("content_id") == body.content_id)
+            if sb.get("concept_index") == concept_index
+            and (not content_id or sb.get("content_id") == content_id)
         ]
         variation_index = len(existing_for_concept)
 
         storyboard_entry = {
-            "concept_index": body.concept_index,
+            "storyboard_id": str(uuid.uuid4()),
+            "concept_index": concept_index,
             "variation_index": variation_index,
-            "content_id": body.content_id,
+            "content_id": content_id,
             "concept_title": concept_title,
             "storyline": storyline,
             "total_cuts": total_cuts,
@@ -1395,28 +1543,75 @@ Return ONLY valid JSON for a single scene:
             "status": "storyline_ready",
         }
 
-        existing_storyboards.append(storyboard_entry)
+        # Use atomic $push to avoid read-modify-write race conditions
+        if storyboard_node:
+            db.content_workflow_nodes.update_one(
+                {"_id": storyboard_node["_id"]},
+                {
+                    "$push": {"output_data.storyboards": storyboard_entry},
+                    "$set": {"output_data.status": "storyboard_ready", "status": "completed", "updated_at": datetime.utcnow()},
+                },
+            )
+        else:
+            from src.content_generation.state import WorkflowState
+            ws = WorkflowState(workflow_id)
+            ws.update_node("storyboard", "completed", output_data={
+                "storyboards": [storyboard_entry],
+                "status": "storyboard_ready",
+            })
 
-        output_data = {
-            "storyboards": existing_storyboards,
-            "status": "storyboard_ready",
-        }
-
-        # Save to node output_data
-        from src.content_generation.state import WorkflowState
-        ws = WorkflowState(workflow_id)
-        ws.update_node("storyboard", "completed", output_data=output_data)
+        # Re-read full output_data for state store sync
+        updated_node = db.content_workflow_nodes.find_one({"workflow_id": workflow_id, "stage_key": "storyboard"})
+        output_data = updated_node.get("output_data", {}) if updated_node else {"storyboards": [storyboard_entry], "status": "storyboard_ready"}
 
         # Save to WorkflowStateStore
+        from src.content_generation.state import WorkflowStateStore
+        state_data = WorkflowStateStore.get_state_data(workflow_id)
         state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
         WorkflowStateStore.save(workflow_id, state_data)
 
-        return storyboard_entry
+        _update_job(status="completed", message="Storyboard generation complete.", storyboard_entry=storyboard_entry)
+
+    except Exception as e:
+        _logger.exception("Error in _run_storyboard_generation (task_id=%s)", task_id)
+        _update_job(status="failed", message=f"Storyboard generation failed: {e}")
+
+
+@router.get("/{workflow_id}/storyboard-status/{task_id}")
+async def get_storyboard_status(workflow_id: str, task_id: str, request: Request):
+    """Check status of a storyboard generation job."""
+    try:
+        from src.auth import get_workos_user_id
+        get_workos_user_id(request)  # validate if JWT present, but allow API key
+
+        job = db.storyboard_generation_jobs.find_one({"task_id": task_id, "workflow_id": workflow_id})
+        if not job:
+            raise HTTPException(status_code=404, detail="Storyboard generation job not found")
+
+        result = {
+            "task_id": job["task_id"],
+            "workflow_id": job["workflow_id"],
+            "content_id": job.get("content_id"),
+            "concept_index": job.get("concept_index"),
+            "status": job["status"],
+            "scenes_total": job.get("scenes_total", 0),
+            "scenes_done": job.get("scenes_done", 0),
+            "message": job.get("message", ""),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+        }
+
+        # Include storyboard_entry when completed
+        if job["status"] == "completed" and job.get("storyboard_entry"):
+            result["storyboard_entry"] = job["storyboard_entry"]
+
+        return result
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_storyboard_status")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 class UpdateSceneRequest(BaseModel):
@@ -1507,12 +1702,13 @@ async def update_storyboard_scene(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in update_storyboard_scene")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}/storyboard/{storyboard_index}")
-async def delete_storyboard(workflow_id: str, storyboard_index: int, request: Request):
-    """Delete a storyboard variation by its index."""
+async def delete_storyboard(workflow_id: str, storyboard_index: int, request: Request, storyboard_id: Optional[str] = None):
+    """Delete a storyboard variation by storyboard_id (preferred) or positional index (legacy)."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
@@ -1525,32 +1721,47 @@ async def delete_storyboard(workflow_id: str, storyboard_index: int, request: Re
         if not storyboard_node or not storyboard_node.get("output_data"):
             raise HTTPException(status_code=400, detail="No storyboard found.")
 
-        output_data = storyboard_node["output_data"]
-        storyboards = output_data.get("storyboards", [])
+        storyboards = storyboard_node["output_data"].get("storyboards", [])
 
-        if storyboard_index < 0 or storyboard_index >= len(storyboards):
-            raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {storyboard_index}")
+        if storyboard_id:
+            # Preferred: atomic $pull by stable storyboard_id
+            result = db.content_workflow_nodes.update_one(
+                {"_id": storyboard_node["_id"]},
+                {
+                    "$pull": {"output_data.storyboards": {"storyboard_id": storyboard_id}},
+                    "$set": {"updated_at": datetime.utcnow()},
+                },
+            )
+            if result.modified_count == 0:
+                raise HTTPException(status_code=400, detail=f"Storyboard {storyboard_id} not found")
+            remaining = len(storyboards) - 1
+        else:
+            # Legacy fallback: delete by positional index (non-atomic)
+            if storyboard_index < 0 or storyboard_index >= len(storyboards):
+                raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {storyboard_index}")
+            storyboards.pop(storyboard_index)
+            output_data = storyboard_node["output_data"]
+            output_data["storyboards"] = storyboards
+            db.content_workflow_nodes.update_one(
+                {"_id": storyboard_node["_id"]},
+                {"$set": {"output_data": output_data, "updated_at": datetime.utcnow()}},
+            )
+            remaining = len(storyboards)
 
-        storyboards.pop(storyboard_index)
-        output_data["storyboards"] = storyboards
-
-        db.content_workflow_nodes.update_one(
-            {"_id": storyboard_node["_id"]},
-            {"$set": {"output_data": output_data, "updated_at": datetime.utcnow()}},
-        )
-
-        # Update WorkflowStateStore
+        # Update WorkflowStateStore with latest data
+        updated_node = db.content_workflow_nodes.find_one({"_id": storyboard_node["_id"]})
         from src.content_generation.state import WorkflowStateStore
         state_data = WorkflowStateStore.get_state_data(workflow_id)
-        state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
+        state_data.setdefault("stage_outputs", {})["storyboard"] = updated_node.get("output_data", {})
         WorkflowStateStore.save(workflow_id, state_data)
 
-        return {"ok": True, "remaining": len(storyboards)}
+        return {"ok": True, "remaining": remaining}
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_storyboard")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/generate-storyboard-image")
@@ -1687,7 +1898,8 @@ async def generate_storyboard_image(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in generate_storyboard_image")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/storyboard-image-status/{task_id}")
@@ -1708,7 +1920,8 @@ async def get_storyboard_image_status(workflow_id: str, task_id: str, request: R
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_storyboard_image_status")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def _generate_storyboard_image_background(
@@ -2000,7 +2213,8 @@ async def generate_concept_image(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in generate_concept_image")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def _generate_concept_image_background(
@@ -2249,14 +2463,16 @@ async def generate_video(
 
         # WS5: Collect feedback for RL
         feedback_bits = []
-        for scene in scenes:
-            scene_fb = _build_feedback_context(workflow_id, "storyboard", scene["id"], body.content_id)
+        for i, scene in enumerate(scenes):
+            scene_id = scene.get("id", f"scene_{i}")
+            scene_fb = _build_feedback_context(workflow_id, "storyboard", scene_id, body.content_id)
             if scene_fb:
-                feedback_bits.append(f"SCENE '{scene['title']}':\n{scene_fb}")
-        for char in characters:
-            char_fb = _build_feedback_context(workflow_id, "storyboard", char["id"], body.content_id)
+                feedback_bits.append(f"SCENE '{scene.get('title', f'Scene {i}')}':\n{scene_fb}")
+        for i, char in enumerate(characters):
+            char_id = char.get("id", f"char_{i}")
+            char_fb = _build_feedback_context(workflow_id, "storyboard", char_id, body.content_id)
             if char_fb:
-                feedback_bits.append(f"CHARACTER '{char['name']}':\n{char_fb}")
+                feedback_bits.append(f"CHARACTER '{char.get('name', f'Character {i}')}':\n{char_fb}")
         
         feedback_context = ""
         if feedback_bits:
@@ -2310,9 +2526,8 @@ async def generate_video(
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in generate_video")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/video-status/{task_id}")
@@ -2559,7 +2774,8 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_video_status")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}/video-variation/{variation_id}")
@@ -2579,7 +2795,8 @@ async def delete_video_variation(workflow_id: str, variation_id: str, request: R
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_video_variation")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/video-jobs")
@@ -2609,7 +2826,8 @@ async def list_video_jobs(workflow_id: str, request: Request):
             })
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in list_video_jobs")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}/video-job/{task_id}", status_code=200)
@@ -2636,7 +2854,8 @@ async def delete_video_job(workflow_id: str, task_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_video_job")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 def _generate_scene_continuity(completed_scenes: list, scene: dict, characters: list) -> str:
@@ -3627,7 +3846,8 @@ Score based on:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in run_simulation")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Predictive Modeling ---
@@ -3903,7 +4123,8 @@ Guidelines:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in predict")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- Content Ranking ---
@@ -4048,7 +4269,8 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in rank")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- WS1: Contents Calendar CRUD ---
@@ -4116,7 +4338,8 @@ async def create_calendar_item(workflow_id: str, body: CalendarItemCreate, reque
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in create_calendar_item")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/calendar")
@@ -4133,7 +4356,8 @@ async def list_calendar_items(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in list_calendar_items")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch("/{workflow_id}/calendar/{content_id}")
@@ -4152,7 +4376,7 @@ async def update_calendar_item(workflow_id: str, content_id: str, body: Calendar
         result = contents_calendar.find_one_and_update(
             {"workflow_id": workflow_id, "content_id": content_id},
             {"$set": updates},
-            return_document=True,
+            return_document=ReturnDocument.AFTER,
         )
         if not result:
             raise HTTPException(status_code=404, detail="Calendar item not found")
@@ -4161,7 +4385,8 @@ async def update_calendar_item(workflow_id: str, content_id: str, body: Calendar
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in update_calendar_item")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}/calendar/{content_id}")
@@ -4180,7 +4405,8 @@ async def delete_calendar_item(workflow_id: str, content_id: str, request: Reque
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_calendar_item")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/{workflow_id}/calendar/migrate")
@@ -4188,7 +4414,6 @@ async def migrate_calendar(workflow_id: str, request: Request):
     """One-time migration: read content_items from workflow config and upsert into contents_calendar."""
     try:
         from src.auth import require_user_id
-        import uuid as _uuid
         workos_user_id = require_user_id(request)
         workflow = _verify_workflow_access(workflow_id, workos_user_id)
 
@@ -4202,7 +4427,21 @@ async def migrate_calendar(workflow_id: str, request: Request):
 
         migrated = 0
         for item in content_items:
-            cid = item.get("content_id") or str(_uuid.uuid4())
+            cid = item.get("content_id")
+            if not cid:
+                import hashlib
+                legacy_fingerprint = json.dumps({
+                    "platform": item.get("platform", ""),
+                    "content_type": item.get("content_type", ""),
+                    "date": item.get("date", ""),
+                    "post_time": item.get("post_time"),
+                    "frequency": item.get("frequency"),
+                    "days": item.get("days"),
+                    "start_date": item.get("start_date"),
+                    "end_date": item.get("end_date"),
+                    "title": item.get("title"),
+                }, sort_keys=True, default=str)
+                cid = f"legacy_{hashlib.sha1(legacy_fingerprint.encode('utf-8')).hexdigest()[:16]}"
             existing = contents_calendar.find_one({"workflow_id": workflow_id, "content_id": cid})
             if existing:
                 continue
@@ -4232,7 +4471,8 @@ async def migrate_calendar(workflow_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in migrate_calendar")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- WS4: Feedback Endpoints ---
@@ -4348,7 +4588,8 @@ async def submit_feedback(workflow_id: str, body: FeedbackCreate, request: Reque
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in submit_feedback")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/feedback")
@@ -4388,7 +4629,8 @@ async def get_item_feedback(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_item_feedback")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{workflow_id}/feedback/summary")
@@ -4436,7 +4678,8 @@ async def get_feedback_summary(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in get_feedback_summary")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{workflow_id}/feedback/{feedback_id}")
@@ -4444,12 +4687,17 @@ async def delete_feedback(workflow_id: str, feedback_id: str, request: Request):
     """Delete own feedback. Returns 403 if not the author."""
     try:
         from src.auth import require_user_id
+        from bson.errors import InvalidId
         workos_user_id = require_user_id(request)
         _verify_workflow_access(workflow_id, workos_user_id)
+        try:
+            feedback_obj_id = ObjectId(feedback_id)
+        except InvalidId:
+            raise HTTPException(status_code=400, detail="Invalid feedback_id")
 
         # Try both collections
         for col in [fdms_feedbacks_col, clients_feedbacks_col]:
-            doc = col.find_one({"_id": ObjectId(feedback_id), "workflow_id": workflow_id})
+            doc = col.find_one({"_id": feedback_obj_id, "workflow_id": workflow_id})
             if doc:
                 if doc.get("user_id") != workos_user_id:
                     raise HTTPException(status_code=403, detail="Can only delete your own feedback")
@@ -4461,19 +4709,22 @@ async def delete_feedback(workflow_id: str, feedback_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _logger.exception("Error in delete_feedback")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # --- WS5: Feedback Context Builder ---
 
 
 def _sanitize_feedback_comment(text: str, max_len: int = 500) -> str:
-    """Sanitize a user feedback comment before injecting into LLM prompts.
-    Truncates, strips control chars, and removes common prompt injection patterns."""
+    """Sanitize user feedback comment — strip control chars and prompt-injection patterns."""
     import re as _re
     text = text[:max_len].strip()
-    # Remove control characters (keep newlines and tabs)
     text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Strip backtick sequences that could escape code fences
+    text = text.replace('```', '')
+    # Strip common prompt injection patterns
+    text = _re.sub(r'(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions?|context|prompts?)', '[filtered]', text)
     return text
 
 
@@ -4532,7 +4783,6 @@ def _build_feedback_context(workflow_id: str, stage_key: str, item_id: str, cont
 
 def _verify_workflow_access(workflow_id: str, workos_user_id: str):
     """Verify user has access to this workflow's organization. API key bypasses org check."""
-    ensure_indexes()
     workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
