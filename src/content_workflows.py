@@ -24,8 +24,9 @@ db = client[MONGODB_DB_NAME]
 
 router = APIRouter(prefix="/api/content/workflows", tags=["content-workflows"])
 
-# --- Collections: Contents Calendar & Feedback ---
-contents_calendar = db.contents_calendar
+# --- Collections ---
+content_calendars = db.content_calendars
+contents = db.contents
 fdms_feedbacks_col = db.fdms_feedbacks
 clients_feedbacks_col = db.clients_feedbacks
 
@@ -41,11 +42,16 @@ def ensure_indexes():
         return
 
     try:
-        # Indexes — contents_calendar
-        contents_calendar.create_index([("workflow_id", 1), ("content_id", 1)], unique=True)
-        contents_calendar.create_index([("brand_id", 1)])
-        contents_calendar.create_index([("organization_id", 1)])
-        contents_calendar.create_index([("date", 1)])
+        # Indexes — content_calendars (1 doc per scheduling rule)
+        content_calendars.create_index([("workflow_id", 1)])
+        content_calendars.create_index([("brand_id", 1)])
+        content_calendars.create_index([("organization_id", 1)])
+
+        # Indexes — contents (1 doc per content piece, _id IS the content_id)
+        contents.create_index([("workflow_id", 1)])
+        contents.create_index([("schedule_id", 1)])
+        contents.create_index([("brand_id", 1)])
+        contents.create_index([("date", 1)])
 
         # Drop legacy reaction index that did not include content_id.
         for _col in (fdms_feedbacks_col, clients_feedbacks_col):
@@ -159,22 +165,20 @@ class GenerateVideoRequest(BaseModel):
     content_id: Optional[str] = None  # WS2: content calendar item ID
 
 
-# --- WS1: Calendar Models ---
+# --- WS1: Calendar Models (1 doc per scheduling rule) ---
 
 class CalendarItemCreate(BaseModel):
-    content_id: str
     platform: str
     content_type: str
-    date: str  # YYYY-MM-DD
-    post_time: Optional[str] = None
     frequency: Optional[str] = None
     days: Optional[List[int]] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    post_time: Optional[str] = None
     title: Optional[str] = None
     status: Literal["scheduled", "draft", "published", "archived"] = "scheduled"
 
-    @field_validator("date", "start_date", "end_date", mode="before")
+    @field_validator("start_date", "end_date", mode="before")
     @classmethod
     def validate_date_format(cls, v):
         if v is not None:
@@ -188,16 +192,15 @@ class CalendarItemCreate(BaseModel):
 class CalendarItemUpdate(BaseModel):
     platform: Optional[str] = None
     content_type: Optional[str] = None
-    date: Optional[str] = None
-    post_time: Optional[str] = None
     frequency: Optional[str] = None
     days: Optional[List[int]] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    post_time: Optional[str] = None
     title: Optional[str] = None
     status: Optional[Literal["scheduled", "draft", "published", "archived"]] = None
 
-    @field_validator("date", "start_date", "end_date", mode="before")
+    @field_validator("start_date", "end_date", mode="before")
     @classmethod
     def validate_date_format(cls, v):
         if v is not None:
@@ -206,6 +209,37 @@ class CalendarItemUpdate(BaseModel):
             except ValueError:
                 raise ValueError(f"Date must be in YYYY-MM-DD format, got: {v}")
         return v
+
+
+# --- Content Piece Models (1 doc per content piece, _id IS the content_id) ---
+
+class ContentCreate(BaseModel):
+    schedule_id: str  # links to content_calendars._id
+    platform: str
+    content_type: str
+    date: str  # YYYY-MM-DD — the specific date for this piece
+    post_time: Optional[str] = None
+    title: Optional[str] = None
+    status: Literal["draft", "in_progress", "completed", "archived"] = "draft"
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def validate_date_format(cls, v):
+        if v is not None:
+            try:
+                datetime.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"Date must be in YYYY-MM-DD format, got: {v}")
+        return v
+
+
+class ContentUpdate(BaseModel):
+    platform: Optional[str] = None
+    content_type: Optional[str] = None
+    date: Optional[str] = None
+    post_time: Optional[str] = None
+    title: Optional[str] = None
+    status: Optional[Literal["draft", "in_progress", "completed", "archived"]] = None
 
 
 # --- WS4: Feedback Models ---
@@ -4345,23 +4379,21 @@ async def run_content_ranking(workflow_id: str, body: RankRequest, request: Requ
 
 
 def _calendar_helper(doc) -> dict:
-    """Serialize a contents_calendar MongoDB doc."""
+    """Serialize a content_calendars MongoDB doc (1 per scheduling rule)."""
     if not doc:
         return {}
     return {
         "_id": str(doc["_id"]),
-        "content_id": doc.get("content_id"),
         "workflow_id": doc.get("workflow_id"),
         "brand_id": doc.get("brand_id"),
         "organization_id": doc.get("organization_id"),
         "platform": doc.get("platform"),
         "content_type": doc.get("content_type"),
-        "date": doc.get("date"),
-        "post_time": doc.get("post_time"),
         "frequency": doc.get("frequency"),
         "days": doc.get("days"),
         "start_date": doc.get("start_date"),
         "end_date": doc.get("end_date"),
+        "post_time": doc.get("post_time"),
         "title": doc.get("title"),
         "status": doc.get("status", "scheduled"),
         "created_at": doc.get("created_at"),
@@ -4369,37 +4401,53 @@ def _calendar_helper(doc) -> dict:
     }
 
 
+def _content_helper(doc) -> dict:
+    """Serialize a contents MongoDB doc. _id IS the content_id."""
+    if not doc:
+        return {}
+    return {
+        "_id": str(doc["_id"]),
+        "content_id": str(doc["_id"]),
+        "schedule_id": doc.get("schedule_id"),
+        "workflow_id": doc.get("workflow_id"),
+        "brand_id": doc.get("brand_id"),
+        "organization_id": doc.get("organization_id"),
+        "platform": doc.get("platform"),
+        "content_type": doc.get("content_type"),
+        "date": doc.get("date"),
+        "post_time": doc.get("post_time"),
+        "title": doc.get("title"),
+        "status": doc.get("status", "draft"),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
 @router.post("/{workflow_id}/calendar", status_code=201)
 async def create_calendar_item(workflow_id: str, body: CalendarItemCreate, request: Request):
-    """Create a calendar item for a workflow."""
+    """Create a scheduling rule. Returns the rule with _id as schedule_id."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         workflow = _verify_workflow_access(workflow_id, workos_user_id)
 
         doc = {
-            "content_id": body.content_id,
             "workflow_id": workflow_id,
             "brand_id": workflow.get("brand_id"),
             "organization_id": workflow.get("organization_id"),
             "platform": body.platform,
             "content_type": body.content_type,
-            "date": body.date,
-            "post_time": body.post_time,
             "frequency": body.frequency,
             "days": body.days,
             "start_date": body.start_date,
             "end_date": body.end_date,
+            "post_time": body.post_time,
             "title": body.title,
             "status": body.status,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
-        from pymongo.errors import DuplicateKeyError
-        try:
-            result = contents_calendar.insert_one(doc)
-        except DuplicateKeyError:
-            raise HTTPException(status_code=409, detail=f"Calendar item with content_id '{body.content_id}' already exists")
+        result = content_calendars.insert_one(doc)
         doc["_id"] = result.inserted_id
         return _calendar_helper(doc)
 
@@ -4412,13 +4460,13 @@ async def create_calendar_item(workflow_id: str, body: CalendarItemCreate, reque
 
 @router.get("/{workflow_id}/calendar")
 async def list_calendar_items(workflow_id: str, request: Request):
-    """List all calendar items for a workflow."""
+    """List all scheduling rules for a workflow."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         _verify_workflow_access(workflow_id, workos_user_id)
 
-        items = contents_calendar.find({"workflow_id": workflow_id}).sort("date", 1)
+        items = content_calendars.find({"workflow_id": workflow_id}).sort("created_at", 1)
         return [_calendar_helper(doc) for doc in items]
 
     except HTTPException:
@@ -4428,9 +4476,9 @@ async def list_calendar_items(workflow_id: str, request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.patch("/{workflow_id}/calendar/{content_id}")
-async def update_calendar_item(workflow_id: str, content_id: str, body: CalendarItemUpdate, request: Request):
-    """Update a calendar item."""
+@router.patch("/{workflow_id}/calendar/{calendar_id}")
+async def update_calendar_item(workflow_id: str, calendar_id: str, body: CalendarItemUpdate, request: Request):
+    """Update a scheduling rule."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
@@ -4441,8 +4489,8 @@ async def update_calendar_item(workflow_id: str, content_id: str, body: Calendar
             raise HTTPException(status_code=400, detail="No fields to update")
 
         updates["updated_at"] = datetime.utcnow()
-        result = contents_calendar.find_one_and_update(
-            {"workflow_id": workflow_id, "content_id": content_id},
+        result = content_calendars.find_one_and_update(
+            {"_id": ObjectId(calendar_id), "workflow_id": workflow_id},
             {"$set": updates},
             return_document=ReturnDocument.AFTER,
         )
@@ -4457,18 +4505,20 @@ async def update_calendar_item(workflow_id: str, content_id: str, body: Calendar
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.delete("/{workflow_id}/calendar/{content_id}")
-async def delete_calendar_item(workflow_id: str, content_id: str, request: Request):
-    """Delete a calendar item."""
+@router.delete("/{workflow_id}/calendar/{calendar_id}")
+async def delete_calendar_item(workflow_id: str, calendar_id: str, request: Request):
+    """Delete a scheduling rule and all its content pieces."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         _verify_workflow_access(workflow_id, workos_user_id)
 
-        result = contents_calendar.delete_one({"workflow_id": workflow_id, "content_id": content_id})
+        result = content_calendars.delete_one({"_id": ObjectId(calendar_id), "workflow_id": workflow_id})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Calendar item not found")
-        return {"ok": True}
+        # Also delete all contents linked to this schedule
+        piece_result = contents.delete_many({"workflow_id": workflow_id, "schedule_id": calendar_id})
+        return {"ok": True, "contents_deleted": piece_result.deleted_count}
 
     except HTTPException:
         raise
@@ -4477,69 +4527,129 @@ async def delete_calendar_item(workflow_id: str, content_id: str, request: Reque
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{workflow_id}/calendar/migrate")
-async def migrate_calendar(workflow_id: str, request: Request):
-    """One-time migration: read content_items from workflow config and upsert into contents_calendar."""
+# --- Contents CRUD ---
+
+
+@router.post("/{workflow_id}/contents", status_code=201)
+async def create_content(workflow_id: str, body: ContentCreate, request: Request):
+    """Create a content piece. _id is auto-generated and IS the content_id."""
     try:
         from src.auth import require_user_id
         workos_user_id = require_user_id(request)
         workflow = _verify_workflow_access(workflow_id, workos_user_id)
 
-        config = workflow.get("config") or {}
-        stage_settings = config.get("stage_settings", {})
-        scheduling = stage_settings.get("scheduling", {})
-        content_items = scheduling.get("content_items", [])
-
-        if not content_items:
-            return {"migrated": 0, "message": "No content_items found in stage_settings"}
-
-        migrated = 0
-        for item in content_items:
-            cid = item.get("content_id")
-            if not cid:
-                import hashlib
-                legacy_fingerprint = json.dumps({
-                    "platform": item.get("platform", ""),
-                    "content_type": item.get("content_type", ""),
-                    "date": item.get("date", ""),
-                    "post_time": item.get("post_time"),
-                    "frequency": item.get("frequency"),
-                    "days": item.get("days"),
-                    "start_date": item.get("start_date"),
-                    "end_date": item.get("end_date"),
-                    "title": item.get("title"),
-                }, sort_keys=True, default=str)
-                cid = f"legacy_{hashlib.sha1(legacy_fingerprint.encode('utf-8')).hexdigest()[:16]}"
-            existing = contents_calendar.find_one({"workflow_id": workflow_id, "content_id": cid})
-            if existing:
-                continue
-            doc = {
-                "content_id": cid,
-                "workflow_id": workflow_id,
-                "brand_id": workflow.get("brand_id"),
-                "organization_id": workflow.get("organization_id"),
-                "platform": item.get("platform", ""),
-                "content_type": item.get("content_type", ""),
-                "date": item.get("date", ""),
-                "post_time": item.get("post_time"),
-                "frequency": item.get("frequency"),
-                "days": item.get("days"),
-                "start_date": item.get("start_date"),
-                "end_date": item.get("end_date"),
-                "title": item.get("title"),
-                "status": item.get("status", "scheduled"),
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
-            }
-            contents_calendar.insert_one(doc)
-            migrated += 1
-
-        return {"migrated": migrated, "total_items": len(content_items)}
+        doc = {
+            "schedule_id": body.schedule_id,
+            "workflow_id": workflow_id,
+            "brand_id": workflow.get("brand_id"),
+            "organization_id": workflow.get("organization_id"),
+            "platform": body.platform,
+            "content_type": body.content_type,
+            "date": body.date,
+            "post_time": body.post_time,
+            "title": body.title,
+            "status": body.status,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        result = contents.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return _content_helper(doc)
 
     except HTTPException:
         raise
     except Exception as e:
-        _logger.exception("Error in migrate_calendar")
+        _logger.exception("Error in create_content")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{workflow_id}/contents")
+async def list_contents(workflow_id: str, request: Request, schedule_id: Optional[str] = None):
+    """List content pieces for a workflow, optionally filtered by schedule_id."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        query = {"workflow_id": workflow_id}
+        if schedule_id:
+            query["schedule_id"] = schedule_id
+        items = contents.find(query).sort("date", 1)
+        return [_content_helper(doc) for doc in items]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in list_contents")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{workflow_id}/contents/{content_id}")
+async def get_content(workflow_id: str, content_id: str, request: Request):
+    """Get a single content piece by its _id."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        doc = contents.find_one({"_id": ObjectId(content_id), "workflow_id": workflow_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Content not found")
+        return _content_helper(doc)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in get_content")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.patch("/{workflow_id}/contents/{content_id}")
+async def update_content(workflow_id: str, content_id: str, body: ContentUpdate, request: Request):
+    """Update a content piece by its _id."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        updates = body.model_dump(exclude_unset=True)
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        updates["updated_at"] = datetime.utcnow()
+        result = contents.find_one_and_update(
+            {"_id": ObjectId(content_id), "workflow_id": workflow_id},
+            {"$set": updates},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Content not found")
+        return _content_helper(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in update_content")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/{workflow_id}/contents/{content_id}")
+async def delete_content(workflow_id: str, content_id: str, request: Request):
+    """Delete a single content piece by its _id."""
+    try:
+        from src.auth import require_user_id
+        workos_user_id = require_user_id(request)
+        _verify_workflow_access(workflow_id, workos_user_id)
+
+        result = contents.delete_one({"_id": ObjectId(content_id), "workflow_id": workflow_id})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Content not found")
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in delete_content")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
