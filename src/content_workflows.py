@@ -1103,7 +1103,7 @@ Return ONLY valid JSON: {{"concepts": [...]}}"""
         anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=4096,
+            max_tokens=16384,
             system=system_prompt,
             messages=[{"role": "user", "content": f"Generate {body.num} content concepts with a {body.tone} tone."}],
         )
@@ -1181,7 +1181,7 @@ async def _call_storyboard_llm(system_prompt: str, user_prompt: str, llm_model: 
             model = genai.GenerativeModel(gemini_model_id)
             response = model.generate_content(
                 [{"role": "user", "parts": [{"text": system_prompt}]}, {"role": "model", "parts": [{"text": "Understood."}]}, {"role": "user", "parts": [{"text": user_prompt}]}],
-                generation_config=genai.types.GenerationConfig(max_output_tokens=4096, temperature=0.7),
+                generation_config=genai.types.GenerationConfig(max_output_tokens=16384, temperature=0.7),
             )
             assistant_text = response.text
             um = getattr(response, 'usage_metadata', None)
@@ -1197,7 +1197,7 @@ async def _call_storyboard_llm(system_prompt: str, user_prompt: str, llm_model: 
             openai_model_map = {"gpt-4o": "gpt-4o", "gpt-5.2": "gpt-4o"}
             openai_model_id = openai_model_map.get(llm_model, llm_model)
             openai_client = OpenAIClient(api_key=OPENAI_API_KEY)
-            response = openai_client.chat.completions.create(model=openai_model_id, max_tokens=4096,
+            response = openai_client.chat.completions.create(model=openai_model_id, max_tokens=16384,
                                                              messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
             assistant_text = response.choices[0].message.content
             save_llm_usage(user_id=workos_user_id, campaign_id=campaign_id, provider="openai", model_name=openai_model_id,
@@ -1212,7 +1212,7 @@ async def _call_storyboard_llm(system_prompt: str, user_prompt: str, llm_model: 
             claude_model_map = {"claude-4.5-sonnet": "claude-sonnet-4-5-20250929", "claude-sonnet": "claude-sonnet-4-5-20250929", "claude-opus": "claude-opus-4-6"}
             claude_model_id = claude_model_map.get(llm_model, "claude-sonnet-4-5-20250929")
             anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            response = anthropic_client.messages.create(model=claude_model_id, max_tokens=4096, system=system_prompt,
+            response = anthropic_client.messages.create(model=claude_model_id, max_tokens=16384, system=system_prompt,
                                                         messages=[{"role": "user", "content": user_prompt}])
             assistant_text = response.content[0].text
             save_llm_usage(user_id=workos_user_id, campaign_id=campaign_id, provider="anthropic", model_name=claude_model_id,
@@ -1244,6 +1244,31 @@ def _parse_json_from_text(text: str) -> dict:
         if isinstance(result, dict):
             return result
         raise HTTPException(status_code=500, detail="LLM response contained a JSON array, expected object")
+    except json.JSONDecodeError:
+        pass
+
+    # Try to repair truncated JSON by closing open braces/brackets
+    json_text = text[start:]
+    open_braces = json_text.count('{') - json_text.count('}')
+    open_brackets = json_text.count('[') - json_text.count(']')
+    # Strip trailing incomplete string/value
+    repaired = json_text.rstrip()
+    if repaired and repaired[-1] not in ']},':
+        # Find last complete value
+        last_comma = repaired.rfind(',')
+        last_brace = repaired.rfind('}')
+        last_bracket = repaired.rfind(']')
+        cut = max(last_comma, last_brace, last_bracket)
+        if cut > 0:
+            repaired = repaired[:cut + 1]
+            # Recalc
+            open_braces = repaired.count('{') - repaired.count('}')
+            open_brackets = repaired.count('[') - repaired.count(']')
+    repaired += ']' * open_brackets + '}' * open_braces
+    try:
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            return result
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse JSON from LLM response: {e}")
 
@@ -1706,33 +1731,45 @@ async def update_storyboard_scene(
 
         storyboard = storyboards[body.storyboard_index]
         scenes = storyboard.get("scenes", [])
+        characters = storyboard.get("characters", [])
 
         scene = next((s for s in scenes if s.get("id") == body.scene_id), None)
-        if not scene:
-            raise HTTPException(status_code=404, detail=f"Scene {body.scene_id} not found")
+        # Also check characters — frontend reuses this endpoint for character edits
+        character = next((c for c in characters if c.get("id") == body.scene_id), None) if not scene else None
+        if not scene and not character:
+            raise HTTPException(status_code=404, detail=f"Scene/character {body.scene_id} not found")
 
         # Update only provided fields
+        target = scene or character
         if body.title is not None:
-            scene["title"] = body.title
+            # For characters, "title" maps to "name"
+            if character:
+                target["name"] = body.title
+            else:
+                target["title"] = body.title
         if body.description is not None:
-            scene["description"] = body.description
-        if body.shot_type is not None:
-            scene["shot_type"] = body.shot_type
-        if body.duration_hint is not None:
-            scene["duration_hint"] = body.duration_hint
-        if body.image_prompt is not None:
-            scene["image_prompt"] = body.image_prompt
-        # WS3: enhanced storyboard fields
-        if body.dialog is not None:
-            scene["dialog"] = body.dialog
-        if body.lighting is not None:
-            scene["lighting"] = body.lighting
-        if body.time_of_day is not None:
-            scene["time_of_day"] = body.time_of_day
-        if body.camera_move is not None:
-            scene["camera_move"] = body.camera_move
-        if body.character_descriptions is not None:
-            scene["character_descriptions"] = body.character_descriptions
+            target["description"] = body.description
+        if scene:
+            if body.shot_type is not None:
+                target["shot_type"] = body.shot_type
+            if body.duration_hint is not None:
+                target["duration_hint"] = body.duration_hint
+            if body.image_prompt is not None:
+                target["image_prompt"] = body.image_prompt
+            # WS3: enhanced storyboard fields
+            if body.dialog is not None:
+                target["dialog"] = body.dialog
+            if body.lighting is not None:
+                target["lighting"] = body.lighting
+            if body.time_of_day is not None:
+                target["time_of_day"] = body.time_of_day
+            if body.camera_move is not None:
+                target["camera_move"] = body.camera_move
+            if body.character_descriptions is not None:
+                target["character_descriptions"] = body.character_descriptions
+        if character:
+            if body.image_prompt is not None:
+                target["image_prompt"] = body.image_prompt
 
         db.content_workflow_nodes.update_one(
             {"_id": storyboard_node["_id"]},
@@ -1742,12 +1779,81 @@ async def update_storyboard_scene(
             }},
         )
 
-        return {"ok": True, "scene": scene}
+        # Also sync to state store
+        from src.content_generation.state import WorkflowStateStore
+        state_data = WorkflowStateStore.get_state_data(workflow_id)
+        state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
+
+        return {"ok": True, "scene": target}
 
     except HTTPException:
         raise
     except Exception as e:
         _logger.exception("Error in update_storyboard_scene")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+class DeleteSceneRequest(BaseModel):
+    storyboard_index: int = 0
+    scene_id: str
+
+
+@router.delete("/{workflow_id}/storyboard-scene")
+async def delete_storyboard_scene(workflow_id: str, body: DeleteSceneRequest, request: Request):
+    """Delete a scene or character from a storyboard."""
+    try:
+        from src.auth import get_workos_user_id
+        workos_user_id = get_workos_user_id(request)
+        if workos_user_id:
+            _verify_workflow_access(workflow_id, workos_user_id)
+        else:
+            workflow = db.content_workflows.find_one({"_id": ObjectId(workflow_id)})
+            if not workflow:
+                raise HTTPException(status_code=404, detail="Workflow not found")
+
+        storyboard_node = db.content_workflow_nodes.find_one({
+            "workflow_id": workflow_id,
+            "stage_key": "storyboard",
+        })
+        if not storyboard_node or not storyboard_node.get("output_data"):
+            raise HTTPException(status_code=400, detail="No storyboard found.")
+
+        output_data = storyboard_node["output_data"]
+        storyboards = output_data.get("storyboards", [])
+
+        if body.storyboard_index < 0 or body.storyboard_index >= len(storyboards):
+            raise HTTPException(status_code=400, detail=f"Invalid storyboard_index {body.storyboard_index}")
+
+        storyboard = storyboards[body.storyboard_index]
+        scenes = storyboard.get("scenes", [])
+        characters = storyboard.get("characters", [])
+
+        scene = next((s for s in scenes if s.get("id") == body.scene_id), None)
+        character = next((c for c in characters if c.get("id") == body.scene_id), None) if not scene else None
+
+        if not scene and not character:
+            raise HTTPException(status_code=404, detail=f"Scene/character {body.scene_id} not found")
+
+        if scene:
+            storyboard["scenes"] = [s for s in scenes if s.get("id") != body.scene_id]
+        else:
+            storyboard["characters"] = [c for c in characters if c.get("id") != body.scene_id]
+
+        db.content_workflow_nodes.update_one(
+            {"_id": storyboard_node["_id"]},
+            {"$set": {"output_data": output_data, "updated_at": datetime.utcnow()}},
+        )
+
+        from src.content_generation.state import WorkflowStateStore
+        state_data = WorkflowStateStore.get_state_data(workflow_id)
+        state_data.setdefault("stage_outputs", {})["storyboard"] = output_data
+
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.exception("Error in delete_storyboard_scene")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -3005,7 +3111,7 @@ async def _run_video_generation(
             from openai import OpenAI as _OpenAI
             _openai_poll_client = _OpenAI()
 
-        async with httpx.AsyncClient(timeout=60) as http:
+        async with httpx.AsyncClient(timeout=120) as http:
             for set_idx in range(count):
                 # WS6: Scene state object for sequential continuity
                 scene_state = {
@@ -3080,7 +3186,7 @@ async def _run_video_generation(
                         entry["external_id"] = external_id
                     except Exception as submit_err:
                         entry["status"] = "failed"
-                        entry["error"] = str(submit_err)
+                        entry["error"] = str(submit_err) or f"{type(submit_err).__name__}: {repr(submit_err)}"
 
                     videos.append(entry)
 
@@ -3106,7 +3212,11 @@ async def _run_video_generation(
                                     if poll_resp.status_code == 200:
                                         op = poll_resp.json()
                                         if op.get("done", False):
-                                            entry["status"] = "completed"
+                                            if op.get("error"):
+                                                entry["status"] = "failed"
+                                                entry["error"] = op["error"].get("message", str(op["error"]))
+                                            else:
+                                                entry["status"] = "completed"
                                             break
                                 elif is_openai_direct:
                                     oai_video = await loop.run_in_executor(
@@ -3117,6 +3227,7 @@ async def _run_video_generation(
                                         break
                                     if oai_video.status == "failed":
                                         entry["status"] = "failed"
+                                        entry["error"] = getattr(oai_video, 'error', None) or "OpenAI video generation failed"
                                         break
                                 else:
                                     # Replicate
@@ -3132,6 +3243,7 @@ async def _run_video_generation(
                                             break
                                         if pd.get("status") == "failed":
                                             entry["status"] = "failed"
+                                            entry["error"] = pd.get("error") or pd.get("logs", "")[-500:] if pd.get("logs") else "Replicate generation failed"
                                             break
                             except Exception as poll_err:
                                 _logger.warning("Polling error for scene %d: %s", j, poll_err)
