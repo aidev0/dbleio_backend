@@ -2720,7 +2720,11 @@ async def get_video_status(workflow_id: str, task_id: str, request: Request):
                         except Exception as dl_err:
                             print(f"Failed to download/upload existing OpenAI video {v.get('external_id')}: {dl_err}")
 
-                    if v.get("status") != "pending":
+                    if v.get("status") == "pending":
+                        pass  # needs polling
+                    elif v.get("status") == "completed" and not v.get("video_url"):
+                        pass  # completed but needs URL extraction
+                    else:
                         continue
 
                     try:
@@ -3217,6 +3221,27 @@ async def _run_video_generation(
                                                 entry["error"] = op["error"].get("message", str(op["error"]))
                                             else:
                                                 entry["status"] = "completed"
+                                                # Extract video URL from response
+                                                resp_data = op.get("response", {})
+                                                gen_resp = resp_data.get("generateVideoResponse", resp_data)
+                                                samples = gen_resp.get("generatedSamples", [])
+                                                if samples:
+                                                    video_uri = samples[0].get("video", {}).get("uri")
+                                                    if video_uri:
+                                                        download_url = f"{video_uri}&key={GOOGLE_API_KEY}"
+                                                        try:
+                                                            gs_uri, gcs_url = await _upload_video_to_gcs(
+                                                                http, download_url, workflow_id, task_id, entry["index"],
+                                                            )
+                                                            entry["video_url"] = gcs_url
+                                                            entry["gs_uri"] = gs_uri
+                                                        except Exception:
+                                                            entry["video_url"] = download_url
+                                                        _write_scene_variation_to_node(
+                                                            workflow_id, entry.get("scene_number", j + 1),
+                                                            entry.get("video_url"), model, task_id,
+                                                            gs_uri=entry.get("gs_uri"),
+                                                        )
                                             break
                                 elif is_openai_direct:
                                     oai_video = await loop.run_in_executor(
