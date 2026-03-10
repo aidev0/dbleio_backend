@@ -110,3 +110,71 @@ Extract whatever financial data is available and return as JSON:
 
 If a field is not available in the content, set it to null.
 Return ONLY valid JSON, no markdown."""
+
+IMAGE_UNDERSTANDING_PROMPT = """You are a visual content analyst specializing in social media marketing.
+Analyze this image (or carousel of images) in detail and extract the following information.
+
+Return your analysis as JSON:
+{{
+  "hook_type": "type of visual hook (bold_text, striking_visual, before_after, product_showcase, lifestyle, humor, trend, aesthetic)",
+  "hook_text": "any text overlaid on the image",
+  "hook_effectiveness": "rating 1-10 and brief explanation",
+  "composition": "description of visual composition and layout",
+  "characters": [
+    {{
+      "age_range": "estimated age range",
+      "gender": "perceived gender",
+      "description": "brief description of appearance, clothing, role"
+    }}
+  ],
+  "textures": ["notable textures/materials visible"],
+  "objects": ["key objects/props visible"],
+  "colors": ["dominant color palette"],
+  "text_content": "all text visible in the image",
+  "mood": "overall mood/feeling of the image",
+  "content_format": "product-shot/lifestyle/flat-lay/outfit-of-day/behind-the-scenes/meme/infographic/quote/UGC/editorial",
+  "success_factors": ["3-5 factors that make this content engaging"],
+  "improvement_suggestions": ["1-3 things that could be improved"]
+}}
+
+Return ONLY valid JSON, no markdown."""
+
+IDEA_EXTRACTION_PROMPT = """You are a creative strategist extracting replicable content ideas from top-performing social media posts.
+
+Brand: @{brand_username}
+Competitor: @{competitor_username}
+
+Below are AI analyses of the top-performing posts from both accounts.
+
+=== BRAND TOP POSTS ===
+{brand_analyses}
+
+=== COMPETITOR TOP POSTS ===
+{competitor_analyses}
+
+Based on these analyses, extract actionable content ideas that the brand could produce.
+For each idea, explain what made the original successful and how to adapt it.
+
+Return as JSON:
+{{
+  "ideas": [
+    {{
+      "title": "short catchy title for the idea",
+      "source": "brand or competitor",
+      "source_post_id": "the shortCode of the inspiring post",
+      "content_type": "reel or post or carousel",
+      "concept": "2-3 sentence description of the content idea",
+      "hook_strategy": "how to hook viewers in the first 3 seconds",
+      "visual_direction": "key visual elements, colors, mood",
+      "script_outline": "brief scene-by-scene outline if video, or layout description if image",
+      "why_it_works": "what made the original successful",
+      "brand_adaptation": "how to customize this for the brand's identity",
+      "estimated_effort": "low/medium/high"
+    }}
+  ],
+  "patterns": ["3-5 recurring patterns across top performers"],
+  "avoid": ["2-3 patterns from worst performers to avoid"],
+  "summary": "2-3 paragraph strategic summary of content opportunities"
+}}
+
+Return ONLY valid JSON, no markdown."""

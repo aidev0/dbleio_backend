@@ -39,6 +39,7 @@ class BrandCreate(BaseModel):
     logo_url: Optional[str] = None
     platforms: List[str] = Field(default_factory=list)
     social_urls: Optional[dict] = None  # e.g. {"instagram": "https://...", "tiktok": "https://..."}
+    competitors: List[dict] = Field(default_factory=list)  # [{"instagram_username": "...", "name": "...", "url": "..."}]
 
 
 class BrandUpdate(BaseModel):
@@ -50,6 +51,7 @@ class BrandUpdate(BaseModel):
     logo_url: Optional[str] = None
     platforms: Optional[List[str]] = None
     social_urls: Optional[dict] = None
+    competitors: Optional[List[dict]] = None
     status: Optional[str] = None  # "active" or "done"
 
 
@@ -68,6 +70,7 @@ def brand_helper(doc) -> dict:
         "logo_url": doc.get("logo_url"),
         "platforms": doc.get("platforms", []),
         "social_urls": doc.get("social_urls", {}),
+        "competitors": doc.get("competitors", []),
         "status": doc.get("status", "active"),
         "created_by": doc.get("created_by"),
         "created_at": doc.get("created_at"),
@@ -115,6 +118,7 @@ async def create_brand(body: BrandCreate, request: Request):
             "logo_url": body.logo_url,
             "platforms": body.platforms,
             "social_urls": body.social_urls or {},
+            "competitors": body.competitors or [],
             "status": "active",
             "created_by": workos_user_id,
             "created_at": now,

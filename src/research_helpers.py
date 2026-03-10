@@ -88,11 +88,7 @@ def get_top_performers(
 
     followers = profile.get("followersCount", 0) or 0
 
-    reels = list(db.instagram_reels.find({"ownerUsername": username}))
-    for r in reels:
-        r["_content_type"] = "reel"
-
-    all_content: List[Dict[str, Any]] = reels
+    all_content = list(db.instagram_posts.find({"ownerUsername": username}))
 
     if not all_content:
         return {
@@ -116,6 +112,7 @@ def get_top_performers(
     def _serialize(item: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": str(item.get("_id", "")),
+            "type": item.get("type"),
             "shortCode": item.get("shortCode"),
             "engagement_score": item["engagement_score"],
             "likesCount": item.get("likesCount", 0),
@@ -133,7 +130,7 @@ def get_top_performers(
     return {
         "username": username,
         "followers": followers,
-        "total_reels": len(all_content),
+        "total_posts": len(all_content),
         "top_count": len(top_items),
         "top_performers": [_serialize(item) for item in top_items],
     }
@@ -148,7 +145,7 @@ def build_trend_data(username: str) -> List[Dict[str, Any]]:
     Group reels by date and aggregate likes, comments, views.
     Returns flat time-series list for charting.
     """
-    docs = list(db.instagram_reels.find({"ownerUsername": username}))
+    docs = list(db.instagram_posts.find({"ownerUsername": username}))
     date_map: Dict[str, Dict[str, int]] = {}
     for doc in docs:
         ts = doc.get("timestamp")
@@ -298,6 +295,37 @@ def _guess_ticker(company_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Whisper transcription
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(video_path: str) -> Optional[str]:
+    """Extract audio from video and transcribe with OpenAI Whisper."""
+    import subprocess
+    audio_path = video_path.replace(".mp4", ".mp3")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", audio_path],
+            capture_output=True, timeout=60,
+        )
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+            return None
+
+        import openai
+        client_oai = openai.OpenAI()
+        with open(audio_path, "rb") as f:
+            resp = client_oai.audio.transcriptions.create(model="whisper-1", file=f)
+        return resp.text if resp.text else None
+    except Exception as e:
+        print(f"Whisper transcription failed: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Video AI analysis (Gemini)
 # ---------------------------------------------------------------------------
 
@@ -369,6 +397,11 @@ def analyze_video_content(video_url: str, proxy: bool = True) -> Dict[str, Any]:
 
         analysis = json.loads(text.strip())
 
+        # Whisper transcription — more accurate than Gemini's transcription
+        whisper_text = transcribe_audio(tmp_path)
+        if whisper_text:
+            analysis["whisper_transcription"] = whisper_text
+
         # Cache for 7 days
         db.research_cache.update_one(
             {"cache_key": cache_key},
@@ -387,6 +420,106 @@ def analyze_video_content(video_url: str, proxy: bool = True) -> Dict[str, Any]:
         return {"error": f"Failed to parse Gemini response: {str(e)}"}
     except Exception as e:
         return {"error": f"Video analysis failed: {str(e)}"}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Image AI analysis (Gemini)
+# ---------------------------------------------------------------------------
+
+def analyze_image_content(image_url: str) -> Dict[str, Any]:
+    """
+    Download image, upload to Gemini, and extract detailed content analysis.
+    """
+    import google.generativeai as genai
+    from src.research_prompts import IMAGE_UNDERSTANDING_PROMPT
+
+    cache_key = f"image_ai:{image_url[:200]}"
+    cached = db.research_cache.find_one({"cache_key": cache_key})
+    if cached and cached.get("expires_at", datetime.min) > datetime.utcnow():
+        return cached["data"]
+
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    if not GOOGLE_API_KEY:
+        return {"error": "GOOGLE_API_KEY not configured"}
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=60.0) as http_client:
+            resp = http_client.get(image_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            })
+            resp.raise_for_status()
+    except Exception as e:
+        return {"error": f"Failed to download image: {str(e)}"}
+
+    content_type = resp.headers.get("content-type", "image/jpeg")
+    suffix = ".jpg" if "jpeg" in content_type or "jpg" in content_type else ".png"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(resp.content)
+        tmp_path = tmp.name
+
+    try:
+        mime = "image/jpeg" if suffix == ".jpg" else "image/png"
+        image_file = genai.upload_file(path=tmp_path, mime_type=mime)
+
+        # Wait for processing
+        max_wait = 30
+        waited = 0
+        while image_file.state.name == "PROCESSING" and waited < max_wait:
+            time.sleep(1)
+            waited += 1
+            image_file = genai.get_file(image_file.name)
+
+        if image_file.state.name != "ACTIVE":
+            return {"error": f"Image processing failed: state={image_file.state.name}"}
+
+        model = genai.GenerativeModel(
+            "gemini-2.0-flash",
+            generation_config={"response_mime_type": "application/json"},
+        )
+        response = model.generate_content([image_file, IMAGE_UNDERSTANDING_PROMPT])
+
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+
+        # Try direct parse, then regex fallback for embedded JSON
+        try:
+            analysis = json.loads(text.strip())
+        except json.JSONDecodeError:
+            import re
+            m = re.search(r'\{[\s\S]*\}', text)
+            if m:
+                analysis = json.loads(m.group())
+            else:
+                raise
+
+        db.research_cache.update_one(
+            {"cache_key": cache_key},
+            {"$set": {
+                "cache_key": cache_key,
+                "data": analysis,
+                "created_at": datetime.utcnow(),
+                "expires_at": datetime.utcnow() + timedelta(days=7),
+            }},
+            upsert=True,
+        )
+        return analysis
+
+    except json.JSONDecodeError as e:
+        return {"error": f"Failed to parse Gemini response: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Image analysis failed: {str(e)}"}
     finally:
         try:
             os.unlink(tmp_path)
