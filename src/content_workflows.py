@@ -3505,10 +3505,16 @@ async def _download_and_upload_openai_video(openai_client, video_id: str, workfl
     return (gs_uri, signed_url)
 
 
-def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_url: str, model: str, task_id: str = "", gs_uri: str = None):
+def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_url: str, model: str, task_id: str = "", gs_uri: str = None, content_id: str = None):
     """Write a single completed scene video as a variation to the video_generation node immediately."""
     if not video_url:
         return
+
+    # Resolve content_id from the job if not provided
+    if not content_id and task_id:
+        job_doc = db.video_generation_jobs.find_one({"task_id": task_id}, {"content_id": 1})
+        if job_doc:
+            content_id = job_doc.get("content_id")
 
     variation = {
         "id": f"{task_id}-scene{scene_number}-{model}",
@@ -3519,6 +3525,8 @@ def _write_scene_variation_to_node(workflow_id: str, scene_number: int, video_ur
         "scene_number": scene_number,
         "model": model,
     }
+    if content_id:
+        variation["content_id"] = content_id
     if gs_uri:
         variation["gs_uri"] = gs_uri
 
