@@ -38,6 +38,7 @@ from src.content_timeline import router as content_timeline_router
 from src.strategies import router as strategies_router
 from src.instagram import router as instagram_router
 from src.research import router as research_router
+from src.agents_demo import router as agents_demo_router
 from src.auth import APIKeyMiddleware
 
 # Initialize FastAPI app
@@ -125,6 +126,7 @@ app.include_router(content_timeline_router)
 app.include_router(strategies_router)
 app.include_router(instagram_router)
 app.include_router(research_router)
+app.include_router(agents_demo_router)
 
 # Root endpoint
 @app.get("/")
